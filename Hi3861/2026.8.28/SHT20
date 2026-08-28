@@ -1,0 +1,206 @@
+# 8.0 SHT20 温湿度采集与信号量实验
+
+## 实验目标
+
+- 使用 I2C 初始化 SHT20 温湿度传感器。
+- 周期性读取温度和湿度。
+- 使用 CMSIS-RTOS2 信号量同步三个线程。
+- 通过串口输出测量结果。
+
+## 目录结构
+
+```text
+8.0_Sht20/
+├── Sht20.c
+├── BUILD.gn
+├── include/
+│   └── hal_bsp_sht20.h
+└── src/
+    └── hal_bsp_sht20.c
+```
+
+注意：不要再创建一层同名的 `8.0_Sht20` 文件夹，否则编译器会提示找不到 `Sht20.c`。
+
+## `Sht20.c`
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "hal_bsp_sht20.h"
+
+static osSemaphoreId_t sem1;
+
+static void thread1(void *argument)
+{
+    (void)argument;
+
+    while (1)
+    {
+        /* 释放两次信号量，使 thread2 和 thread3 都能获得一次。 */
+        osSemaphoreRelease(sem1);
+        osSemaphoreRelease(sem1);
+
+        printf("Thread1 released semaphore!\r\n");
+        osDelay(300); // 约3秒
+    }
+}
+
+static void thread2(void *argument)
+{
+    (void)argument;
+
+    float temperature = 0;
+    float humidity = 0;
+
+    printf("SHT20 demo started.\r\n");
+    SHT20_Init();
+
+    while (1)
+    {
+        osSemaphoreAcquire(sem1, osWaitForever);
+
+        SHT20_ReadData(&temperature, &humidity);
+        printf("temperature = %.2f    humidity = %.2f\r\n",
+               temperature,
+               humidity);
+        printf("Thread2 acquired semaphore!\r\n");
+
+        osDelay(1);
+    }
+}
+
+static void thread3(void *argument)
+{
+    (void)argument;
+
+    while (1)
+    {
+        osSemaphoreAcquire(sem1, osWaitForever);
+        printf("Thread3 acquired semaphore!\r\n");
+        osDelay(1);
+    }
+}
+
+static void i2c_sht20_demo(void)
+{
+    osThreadAttr_t attr = {0};
+
+    /* 必须在线程启动前创建信号量，避免线程提前访问空句柄。 */
+    sem1 = osSemaphoreNew(4, 0, NULL);
+
+    if (sem1 == NULL)
+    {
+        printf("Failed to create semaphore.\r\n");
+        return;
+    }
+
+    attr.stack_size = 1024 * 4;
+    attr.priority = 25;
+
+    attr.name = "thread1";
+    if (osThreadNew(thread1, NULL, &attr) == NULL)
+    {
+        printf("Failed to create thread1.\r\n");
+    }
+
+    attr.name = "thread2";
+    if (osThreadNew(thread2, NULL, &attr) == NULL)
+    {
+        printf("Failed to create thread2.\r\n");
+    }
+
+    attr.name = "thread3";
+    if (osThreadNew(thread3, NULL, &attr) == NULL)
+    {
+        printf("Failed to create thread3.\r\n");
+    }
+}
+
+APP_FEATURE_INIT(i2c_sht20_demo);
+```
+
+## 本工程的 `BUILD.gn`
+
+```gn
+static_library("Sht20") {
+    sources = [
+        "Sht20.c",
+        "src/hal_bsp_sht20.c",
+    ]
+
+    include_dirs = [
+        "//utils/native/lite/include",
+        "//kernel/liteos_m/components/cmsis/2.0",
+        "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+        "include",
+    ]
+}
+```
+
+## APP 的 `BUILD.gn`
+
+文件位置：
+
+```text
+applications/sample/wifi-iot/app/BUILD.gn
+```
+
+只启用本实验：
+
+```gn
+import("//build/lite/config/component/lite_component.gni")
+
+lite_component("app") {
+    features = [
+        #"1.0_Hello_World:hello_world",
+        #"2.0_TCRT_Timer:TCRT",
+        #"3.0_SG90_Mutex:SG90",
+        #"4.0_Hcsr04_Tick:Hcsr04",
+        #"5.0_Uart_BLE:Uart",
+        #"6.0_Sum_Experiment_First:Sum_Experiment_First",
+        #"7.0_I2c_Ssd1306:I2c_Ssd1306",
+        "8.0_Sht20:Sht20",
+    ]
+}
+```
+
+## 编译与烧录
+
+```bash
+python build.py wifiiot
+```
+
+烧录：
+
+```text
+out/wifiiot/Hi3861_wifiiot_app_allinone.bin
+```
+
+## 预期串口输出
+
+```text
+SHT20 demo started.
+Thread1 released semaphore!
+temperature = 27.34    humidity = 51.32
+Thread2 acquired semaphore!
+Thread3 acquired semaphore!
+```
+
+串口参数为 `115200、8 数据位、1 停止位、无校验、无流控`。
+
+## 常见问题
+
+### 编译器找不到 `Sht20.c`
+
+确认 `Sht20.c` 与本工程的 `BUILD.gn` 位于同一层目录。
+
+### 出现 I2C 未定义引用
+
+确认 `usr_config.mk` 中包含：
+
+```makefile
+CONFIG_I2C_SUPPORT=y
+```
