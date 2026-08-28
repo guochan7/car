@@ -1,0 +1,66 @@
+# 2026 年 8 月 28 日工作日志
+
+## 今日目标
+
+- 完成 Hi3861 I2C SSD1306 OLED 实验的代码与构建配置。
+- 完成 Hi3861 SHT20 温湿度采集及信号量同步实验。
+- 完成固件编译和串口调试。
+
+## 完成内容
+
+### 1. SSD1306 OLED 工程
+
+- 编写 OLED 初始化、清屏和字符串显示代码。
+- 创建 OpenHarmony 线程，每秒刷新一次模拟时钟。
+- 配置工程级和 APP 级 `BUILD.gn`。
+- 编译阶段遇到以下 I2C 链接错误：
+
+```text
+undefined reference to `hi_i2c_write'
+undefined reference to `hi_i2c_init'
+undefined reference to `hi_i2c_set_baudrate'
+```
+
+- 在 `vendor/hisi/hi3861/hi3861/build/config/usr_config.mk` 中启用：
+
+```makefile
+CONFIG_I2C_SUPPORT=y
+```
+
+- I2C 链接问题得到解决。
+
+### 2. SHT20 温湿度工程
+
+- 编写三个线程和一个计数信号量：
+  - `thread1` 周期性释放两次信号量。
+  - `thread2` 获取信号量后读取温湿度。
+  - `thread3` 获取信号量后输出同步状态。
+- 使用 `osSemaphoreNew`、`osSemaphoreRelease` 和 `osSemaphoreAcquire` 完成线程同步。
+- 配置 `Sht20.c`、SHT20 驱动文件和 `BUILD.gn`。
+- 修复 `8.0_Sht20/8.0_Sht20/Sht20.c` 多嵌套一层目录造成的构建错误。
+- 调整初始化顺序，在线程启动前创建信号量，避免线程访问空信号量句柄。
+- 串口成功读取温度和湿度数据，例如：
+
+```text
+temperature = 27.34    humidity = 51.32
+```
+
+### 3. 串口乱码处理
+
+- 观察到英文和数字显示正常，只有中文日志乱码。
+- 判断串口参数正确，问题来自 UTF-8 与串口助手显示编码不一致。
+- 将运行日志改为英文，避免编码兼容问题。
+
+## 关键命令
+
+编译 OpenHarmony Hi3861 固件：
+
+```bash
+python build.py wifiiot
+```
+
+## 今日结果
+
+- Hi3861 I2C 支持已启用。
+- SSD1306 和 SHT20 工程代码及构建配置已整理。
+- SHT20 温湿度数据读取成功。
