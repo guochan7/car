@@ -1,0 +1,164 @@
+7.0 I2C SSD1306 OLED 显示实验
+
+## 实验目标
+
+- 初始化 SSD1306 OLED 显示屏。
+- 显示固定字符串。
+- 每秒更新一次模拟时钟。
+- 掌握 OpenHarmony 线程创建和 I2C 外设调用。
+
+## 目录结构
+
+```text
+7.0_I2c_Ssd1306/
+├── I2c_Ssd1306.c
+├── BUILD.gn
+├── include/
+│   └── hal_bsp_ssd1306.h
+└── src/
+    └── hal_bsp_ssd1306.c
+```
+
+## `I2c_Ssd1306.c`
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "hal_bsp_ssd1306.h"
+
+static void Task1(void *argument)
+{
+    (void)argument;
+
+    uint8_t displayBuff[20] = {0};
+    uint8_t hour = 16;
+    uint8_t min = 0;
+    uint8_t sec = 0;
+
+    SSD1306_Init();
+    SSD1306_CLS();
+    SSD1306_ShowStr(0, 0, (uint8_t *)"    QST CAR    ", 16);
+    SSD1306_ShowStr(0, 3, (uint8_t *)"2025:10:08", 16);
+
+    while (1)
+    {
+        sec++;
+
+        if (sec > 59)
+        {
+            sec = 0;
+            min++;
+        }
+
+        if (min > 59)
+        {
+            min = 0;
+            hour++;
+        }
+
+        if (hour > 23)
+        {
+            hour = 0;
+        }
+
+        memset(displayBuff, 0, sizeof(displayBuff));
+        snprintf((char *)displayBuff,
+                 sizeof(displayBuff),
+                 "%02d:%02d:%02d",
+                 hour,
+                 min,
+                 sec);
+
+        SSD1306_ShowStr(0, 2, displayBuff, 16);
+        sleep(1);
+    }
+}
+
+static void i2c_ssd1306_demo(void)
+{
+    osThreadAttr_t options = {0};
+
+    options.name = "thread_1";
+    options.stack_size = 1024;
+    options.priority = osPriorityNormal;
+
+    osThreadId_t task1Id = osThreadNew(Task1, NULL, &options);
+
+    if (task1Id == NULL)
+    {
+        printf("Failed to create Task1.\r\n");
+    }
+    else
+    {
+        printf("Task1 created successfully.\r\n");
+    }
+}
+
+APP_FEATURE_INIT(i2c_ssd1306_demo);
+```
+
+## 本工程的 `BUILD.gn`
+
+```gn
+static_library("I2c_Ssd1306") {
+    sources = [
+        "I2c_Ssd1306.c",
+        "src/hal_bsp_ssd1306.c",
+    ]
+
+    include_dirs = [
+        "//utils/native/lite/include",
+        "//kernel/liteos_m/components/cmsis/2.0",
+        "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+        "include",
+    ]
+}
+```
+
+## APP 的 `BUILD.gn`
+
+文件位置：
+
+```text
+applications/sample/wifi-iot/app/BUILD.gn
+```
+
+只启用本实验：
+
+```gn
+import("//build/lite/config/component/lite_component.gni")
+
+lite_component("app") {
+    features = [
+        #"1.0_Hello_World:hello_world",
+        #"2.0_TCRT_Timer:TCRT",
+        #"3.0_SG90_Mutex:SG90",
+        #"4.0_Hcsr04_Tick:Hcsr04",
+        #"5.0_Uart_BLE:Uart",
+        #"6.0_Sum_Experiment_First:Sum_Experiment_First",
+        "7.0_I2c_Ssd1306:I2c_Ssd1306",
+        #"8.0_Sht20:Sht20",
+    ]
+}
+```
+
+## 编译与烧录
+
+```bash
+python build.py wifiiot
+```
+
+烧录：
+
+```text
+out/wifiiot/Hi3861_wifiiot_app_allinone.bin
+```
+
+## 预期现象
+
+OLED 显示固定标题和日期，并以 `HH:MM:SS` 格式每秒刷新时间。
