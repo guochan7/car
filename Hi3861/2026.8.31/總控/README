@@ -1,0 +1,38 @@
+# 第一阶段综合实验
+
+已在远程工程的 `applications/sample/wifi-iot/app/6.0_Sum_Experiment_First` 中创建：
+
+- `Sum_Experiment_First.c`
+- `BUILD.gn`
+
+同时已修改 `applications/sample/wifi-iot/app/BUILD.gn`，只启用：
+
+```gn
+"6.0_Sum_Experiment_First:Sum_Experiment_First",
+```
+
+## 功能
+
+1. 任务1：舵机在约 45°/135°之间交替转动，并用超声波测量左右距离。
+2. 任务2：启动后前 15 秒读取 GPIO13/GPIO14 红外对管并输出寻线判断；15 秒后切换至 UART1 蓝牙通信。
+3. 任务3：阻塞读取消息队列并打印任务1、任务2的信息。
+4. 任务1和任务2通过两个信号量严格交替运行，任务3独立运行。
+
+## 引脚
+
+- 舵机：GPIO2
+- 超声波 TRIG：GPIO7
+- 超声波 ECHO：GPIO8
+- 左红外：GPIO13
+- 右红外：GPIO14
+- 蓝牙 UART1 TX/RX：GPIO0/GPIO1，9600 波特率
+
+## 编译
+
+在工程根目录执行：
+
+```sh
+python build.py wifiiot
+```
+
+看到 `BUILD SUCCESS` 后再烧录。若编译器显示具体报错，请保留从第一条 `error:` 开始的内容。
