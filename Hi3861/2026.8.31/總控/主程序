@@ -1,0 +1,306 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "hi_time.h"
+#include "wifiiot_errno.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include "wifiiot_uart.h"
+
+/* Hardware pins, confirmed from the car schematic and the existing examples. */
+#define SERVO_GPIO              2
+#define ULTRASONIC_TRIG_GPIO    7
+#define ULTRASONIC_ECHO_GPIO    8
+#define TCRT_LEFT_GPIO          13
+#define TCRT_RIGHT_GPIO         14
+
+#define UART_RX_SIZE            128
+#define MESSAGE_QUEUE_COUNT     16
+#define TASK_STACK_SIZE         (1024 * 8)
+#define LINE_TRACK_TIME_MS      15000U
+#define ULTRASONIC_TIMEOUT_US   30000U
+
+typedef struct {
+    uint8_t source;
+    char text[128];
+} ExperimentMessage;
+
+static osMessageQueueId_t g_messageQueue;
+static osSemaphoreId_t g_task1Turn;
+static osSemaphoreId_t g_task2Turn;
+static uint32_t g_startTick;
+static uint8_t g_scanLeft = 1;
+static uint8_t g_bluetoothStarted = 0;
+
+static void Task1ServoUltrasonic(void);
+static void Task2LineAndBluetooth(void);
+static void Task3PrintQueue(void);
+
+static void SendQueueMessage(uint8_t source, const char *text)
+{
+    ExperimentMessage message = {0};
+    message.source = source;
+    (void)snprintf(message.text, sizeof(message.text), "%s", text);
+
+    if (osMessageQueuePut(g_messageQueue, &message, 0U, 0U) != osOK) {
+        printf("Message queue is full.\r\n");
+    }
+}
+
+static uint32_t GetElapsedMs(void)
+{
+    uint32_t tickFrequency = osKernelGetTickFreq();
+    uint32_t elapsedTicks = osKernelGetTickCount() - g_startTick;
+
+    if (tickFrequency == 0U) {
+        return 0U;
+    }
+    return (uint32_t)(((uint64_t)elapsedTicks * 1000U) / tickFrequency);
+}
+
+static void SetServoAngle(uint16_t highTimeUs)
+{
+    int i;
+    for (i = 0; i < 10; i++) {
+        GpioSetOutputVal(SERVO_GPIO, WIFI_IOT_GPIO_VALUE1);
+        hi_udelay(highTimeUs);
+        GpioSetOutputVal(SERVO_GPIO, WIFI_IOT_GPIO_VALUE0);
+        hi_udelay(20000U - highTimeUs);
+    }
+}
+
+static float MeasureDistanceCm(void)
+{
+    WifiIotGpioValue echoValue;
+    uint32_t waitStart;
+    uint32_t echoStart;
+    uint32_t echoEnd;
+
+    GpioSetOutputVal(ULTRASONIC_TRIG_GPIO, WIFI_IOT_GPIO_VALUE0);
+    hi_udelay(2U);
+    GpioSetOutputVal(ULTRASONIC_TRIG_GPIO, WIFI_IOT_GPIO_VALUE1);
+    hi_udelay(10U);
+    GpioSetOutputVal(ULTRASONIC_TRIG_GPIO, WIFI_IOT_GPIO_VALUE0);
+
+    waitStart = hi_get_us();
+    do {
+        GpioGetInputVal(ULTRASONIC_ECHO_GPIO, &echoValue);
+        if ((uint32_t)(hi_get_us() - waitStart) > ULTRASONIC_TIMEOUT_US) {
+            return -1.0f;
+        }
+    } while (echoValue == WIFI_IOT_GPIO_VALUE0);
+
+    echoStart = hi_get_us();
+    do {
+        GpioGetInputVal(ULTRASONIC_ECHO_GPIO, &echoValue);
+        if ((uint32_t)(hi_get_us() - echoStart) > ULTRASONIC_TIMEOUT_US) {
+            return -1.0f;
+        }
+    } while (echoValue == WIFI_IOT_GPIO_VALUE1);
+    echoEnd = hi_get_us();
+
+    return ((float)(echoEnd - echoStart) * 0.034f) / 2.0f;
+}
+
+static void ReadLineSensors(void)
+{
+    WifiIotGpioValue left;
+    WifiIotGpioValue right;
+    char message[128];
+    const char *decision;
+
+    GpioGetInputVal(TCRT_LEFT_GPIO, &left);
+    GpioGetInputVal(TCRT_RIGHT_GPIO, &right);
+
+    if ((left == WIFI_IOT_GPIO_VALUE0) && (right == WIFI_IOT_GPIO_VALUE1)) {
+        decision = "line on left: turn left";
+    } else if ((left == WIFI_IOT_GPIO_VALUE1) && (right == WIFI_IOT_GPIO_VALUE0)) {
+        decision = "line on right: turn right";
+    } else if ((left == WIFI_IOT_GPIO_VALUE0) && (right == WIFI_IOT_GPIO_VALUE0)) {
+        decision = "both black: stop/crossing";
+    } else {
+        decision = "both white: search/forward";
+    }
+
+    (void)snprintf(message, sizeof(message),
+        "TCRT left=%u right=%u, %s",
+        (unsigned int)left, (unsigned int)right, decision);
+    SendQueueMessage(2U, message);
+}
+
+static void StartBluetoothUart(void)
+{
+    uint32_t ret;
+    WifiIotUartAttribute uartAttribute = {
+        .baudRate = 9600,
+        .dataBits = 8,
+        .stopBits = 1,
+        .parity = 0,
+    };
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_0, WIFI_IOT_IO_FUNC_GPIO_0_UART1_TXD);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_1, WIFI_IOT_IO_FUNC_GPIO_1_UART1_RXD);
+
+    ret = UartInit(WIFI_IOT_UART_IDX_1, &uartAttribute, NULL);
+    if (ret != WIFI_IOT_SUCCESS) {
+        SendQueueMessage(2U, "UART1 initialization failed");
+        return;
+    }
+
+    g_bluetoothStarted = 1U;
+    UartWrite(WIFI_IOT_UART_IDX_1,
+        (unsigned char *)"Bluetooth communication started\r\n",
+        strlen("Bluetooth communication started\r\n"));
+    SendQueueMessage(2U, "15 seconds reached: Bluetooth started");
+}
+
+static void BluetoothCommunicationOnce(void)
+{
+    uint8_t receiveBuffer[UART_RX_SIZE + 1] = {0};
+    uint32_t receiveLength;
+    char message[128];
+
+    if (g_bluetoothStarted == 0U) {
+        StartBluetoothUart();
+        if (g_bluetoothStarted == 0U) {
+            return;
+        }
+    }
+
+    receiveLength = UartRead(WIFI_IOT_UART_IDX_1, receiveBuffer, UART_RX_SIZE);
+    if (receiveLength > UART_RX_SIZE) {
+        receiveLength = UART_RX_SIZE;
+    }
+    receiveBuffer[receiveLength] = '\0';
+
+    if (receiveLength > 0U) {
+        (void)snprintf(message, sizeof(message), "Bluetooth RX: %s", (char *)receiveBuffer);
+        SendQueueMessage(2U, message);
+        UartWrite(WIFI_IOT_UART_IDX_1, receiveBuffer, receiveLength);
+    } else {
+        SendQueueMessage(2U, "Bluetooth waiting for data");
+    }
+}
+
+static void Task1ServoUltrasonic(void)
+{
+    char message[128];
+    float distance;
+
+    while (1) {
+        osSemaphoreAcquire(g_task1Turn, osWaitForever);
+
+        if (g_scanLeft != 0U) {
+            SetServoAngle(1000U); /* About 45 degrees: look left. */
+        } else {
+            SetServoAngle(2000U); /* About 135 degrees: look right. */
+        }
+
+        distance = MeasureDistanceCm();
+        if (distance < 0.0f) {
+            (void)snprintf(message, sizeof(message), "%s ultrasonic timeout",
+                (g_scanLeft != 0U) ? "LEFT" : "RIGHT");
+        } else {
+            (void)snprintf(message, sizeof(message), "%s distance: %.2f cm",
+                (g_scanLeft != 0U) ? "LEFT" : "RIGHT", distance);
+        }
+        SendQueueMessage(1U, message);
+        g_scanLeft = (uint8_t)!g_scanLeft;
+
+        osDelay(100U);
+        osSemaphoreRelease(g_task2Turn);
+    }
+}
+
+static void Task2LineAndBluetooth(void)
+{
+    while (1) {
+        osSemaphoreAcquire(g_task2Turn, osWaitForever);
+
+        if (GetElapsedMs() < LINE_TRACK_TIME_MS) {
+            ReadLineSensors();
+        } else {
+            BluetoothCommunicationOnce();
+        }
+
+        osDelay(100U);
+        osSemaphoreRelease(g_task1Turn);
+    }
+}
+
+static void Task3PrintQueue(void)
+{
+    ExperimentMessage message;
+
+    while (1) {
+        if (osMessageQueueGet(g_messageQueue, &message, NULL, osWaitForever) == osOK) {
+            printf("[Task3][source=%u] %s\r\n",
+                (unsigned int)message.source, message.text);
+        }
+    }
+}
+
+static void HardwareInit(void)
+{
+    GpioInit();
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_2, WIFI_IOT_IO_FUNC_GPIO_2_GPIO);
+    GpioSetDir(SERVO_GPIO, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetOutputVal(SERVO_GPIO, WIFI_IOT_GPIO_VALUE0);
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_7, WIFI_IOT_IO_FUNC_GPIO_7_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_8, WIFI_IOT_IO_FUNC_GPIO_8_GPIO);
+    GpioSetDir(ULTRASONIC_TRIG_GPIO, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetDir(ULTRASONIC_ECHO_GPIO, WIFI_IOT_GPIO_DIR_IN);
+    GpioSetOutputVal(ULTRASONIC_TRIG_GPIO, WIFI_IOT_GPIO_VALUE0);
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_13, WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_14, WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
+    GpioSetDir(TCRT_LEFT_GPIO, WIFI_IOT_GPIO_DIR_IN);
+    GpioSetDir(TCRT_RIGHT_GPIO, WIFI_IOT_GPIO_DIR_IN);
+}
+
+static void SumExperimentEntry(void)
+{
+    osThreadAttr_t attribute = {0};
+
+    HardwareInit();
+    g_startTick = osKernelGetTickCount();
+
+    g_messageQueue = osMessageQueueNew(
+        MESSAGE_QUEUE_COUNT, sizeof(ExperimentMessage), NULL);
+    g_task1Turn = osSemaphoreNew(1U, 1U, NULL);
+    g_task2Turn = osSemaphoreNew(1U, 0U, NULL);
+
+    if ((g_messageQueue == NULL) || (g_task1Turn == NULL) || (g_task2Turn == NULL)) {
+        printf("Failed to create RTOS objects.\r\n");
+        return;
+    }
+
+    attribute.attr_bits = 0U;
+    attribute.cb_mem = NULL;
+    attribute.cb_size = 0U;
+    attribute.stack_mem = NULL;
+    attribute.stack_size = TASK_STACK_SIZE;
+    attribute.priority = osPriorityNormal;
+
+    attribute.name = "Task1ServoUltrasonic";
+    if (osThreadNew((osThreadFunc_t)Task1ServoUltrasonic, NULL, &attribute) == NULL) {
+        printf("Failed to create task1.\r\n");
+    }
+
+    attribute.name = "Task2LineBluetooth";
+    if (osThreadNew((osThreadFunc_t)Task2LineAndBluetooth, NULL, &attribute) == NULL) {
+        printf("Failed to create task2.\r\n");
+    }
+
+    attribute.name = "Task3PrintQueue";
+    if (osThreadNew((osThreadFunc_t)Task3PrintQueue, NULL, &attribute) == NULL) {
+        printf("Failed to create task3.\r\n");
+    }
+}
+
+APP_FEATURE_INIT(SumExperimentEntry);
