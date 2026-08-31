@@ -1,0 +1,270 @@
+本项目基于 OpenHarmony LiteOS-M 和 Hi3861，实现对两个 TCRT5000 红外传感器数字输出的周期性读取。
+
+- 左侧传感器：GPIO13
+- 右侧传感器：GPIO14
+- 检测到黑色：输入低电平
+- 检测到白色：输入高电平
+- 使用 CMSIS-RTOS2 周期定时器读取传感器状态
+
+## 项目结构
+
+```text
+applications/sample/wifi-iot/app/
+├── BUILD.gn
+└── 2.0_TCRT_Timer/
+    ├── BUILD.gn
+    └── TCRT.c
+```
+
+## 硬件连接
+
+| TCRT5000 接口 | Hi3861 接口 |
+| --- | --- |
+| 左侧传感器 DO | GPIO13 |
+| 右侧传感器 DO | GPIO14 |
+| VCC | 按模块要求连接 3.3V |
+| GND | GND |
+
+> GPIO13 和 GPIO14 也可复用为 I2C0 引脚。运行本实验时，不要同时启用占用这两个引脚的 OLED、MPU6050、AHT20 等 I2C 程序。
+
+## `TCRT.c`
+
+文件位置：
+
+```text
+applications/sample/wifi-iot/app/2.0_TCRT_Timer/TCRT.c
+```
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include "ohos_init.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include <stdlib.h>
+#include <memory.h>
+#include "cmsis_os2.h"
+#include "hi_io.h"
+#include "hi_time.h"
+
+#define GPIOL 13
+#define GPIOR 14
+
+uint32_t exec1;             // 时间变量
+osTimerId_t id1;            // 定时器 ID
+uint32_t timerDelay_1;      // 定时器延时时间
+osStatus_t status;          // 定时器返回参数
+
+/* 函数声明 */
+static void TCRTTask(void);
+void get_tcrt5000_value(void);
+void Timer1_Callback(void *arg);
+
+/* 创建任务 */
+void TCRT(void)
+{
+    GpioInit(); // 初始化 GPIO
+
+    // 将 GPIO13、GPIO14 复用为普通 GPIO
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_13,
+              WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_14,
+              WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
+
+    // 设置 GPIO 为输入模式
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_13,
+               WIFI_IOT_GPIO_DIR_IN);
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_14,
+               WIFI_IOT_GPIO_DIR_IN);
+
+    osThreadAttr_t attr;
+
+    attr.name = "TCRTTask";
+    attr.attr_bits = 0U;
+    attr.cb_mem = NULL;
+    attr.cb_size = 0U;
+    attr.stack_mem = NULL;
+    attr.stack_size = 10240;
+    attr.priority = 25;
+
+    if (osThreadNew((osThreadFunc_t)TCRTTask, NULL, &attr) == NULL) {
+        printf("Failed to create TCRTTask!\n");
+    }
+}
+
+/* TCRT 任务 */
+static void TCRTTask(void)
+{
+    printf("start test tcrt5000\n\n");
+
+    /* 创建周期定时器 */
+    exec1 = 1U;
+
+    id1 = osTimerNew(Timer1_Callback,
+                     osTimerPeriodic,
+                     &exec1,
+                     NULL);
+
+    if (id1 != NULL) {
+        /*
+         * Hi3861 中 1U 约为 10ms。
+         * 5U 约为 50ms；如需 2 秒周期，可改为 200U。
+         */
+        timerDelay_1 = 5U;
+
+        status = osTimerStart(id1, timerDelay_1);
+
+        if (status != osOK) {
+            printf("Timer could not be started\r\n");
+        } else {
+            printf("定时器开启成功！\n");
+        }
+    } else {
+        printf("Timer could not be created\r\n");
+    }
+}
+
+/* 获取两个红外传感器的数字电平 */
+void get_tcrt5000_value(void)
+{
+    WifiIotGpioValue id_status;
+
+    // 读取 GPIO13：左侧传感器
+    GpioGetInputVal(GPIOL, &id_status);
+
+    if (id_status == WIFI_IOT_GPIO_VALUE0) {
+        printf("left black\r\n");
+    } else {
+        printf("left white\r\n");
+    }
+
+    // 读取 GPIO14：右侧传感器
+    GpioGetInputVal(GPIOR, &id_status);
+
+    if (id_status == WIFI_IOT_GPIO_VALUE0) {
+        printf("right black\r\n");
+    } else {
+        printf("right white\r\n");
+    }
+}
+
+/* 定时器回调函数 */
+void Timer1_Callback(void *arg)
+{
+    (void)arg;
+
+    get_tcrt5000_value();
+
+    /*
+     * 如需关闭定时器，可使用：
+     *
+     * status = osTimerStop(id1);
+     * if (status == osOK) {
+     *     printf("定时器关闭成功\n");
+     * }
+     */
+}
+
+/* 注册并启动任务，放在文件末尾 */
+APP_FEATURE_INIT(TCRT);
+```
+
+## 模块 `BUILD.gn`
+
+文件位置：
+
+```text
+applications/sample/wifi-iot/app/2.0_TCRT_Timer/BUILD.gn
+```
+
+```gn
+static_library("TCRT") {
+    sources = [
+        "TCRT.c"
+    ]
+
+    include_dirs = [
+        "//utils/native/lite/include",
+        "//kernel/liteos_m/components/cmsis/2.0",
+        "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+    ]
+}
+```
+
+## 应用 `BUILD.gn`
+
+文件位置：
+
+```text
+applications/sample/wifi-iot/app/BUILD.gn
+```
+
+```gn
+import("//build/lite/config/component/lite_component.gni")
+
+lite_component("app") {
+    features = [
+        "2.0_TCRT_Timer:TCRT",
+    ]
+}
+```
+
+运行本实验时，建议 `features` 中只保留 TCRT 模块，避免其他实验同时占用 GPIO13 和 GPIO14。
+
+## 编译
+
+在 OpenHarmony 源码根目录运行：
+
+```bash
+python build.py wifiiot
+```
+
+看到以下信息表示编译成功：
+
+```text
+ohos wifiiot build success!
+```
+
+如果不知道生成的固件在哪里，可以运行：
+
+```bash
+find . -name "Hi3861_wifiiot_app_allinone.bin"
+```
+
+烧录时请选择本次编译生成、修改时间最新的固件文件。
+
+## 预期串口输出
+
+串口参数通常设置为 `115200 8N1`。程序正常运行后应看到类似输出：
+
+```text
+start test tcrt5000
+
+定时器开启成功！
+left black
+right white
+left white
+right white
+```
+
+实际的 `black` 和 `white` 会随传感器检测结果变化。
+
+## 修改采样周期
+
+代码中的：
+
+```c
+timerDelay_1 = 5U;
+```
+
+约等于 50ms。如果需要每 2 秒读取一次，改为：
+
+```c
+timerDelay_1 = 200U;
+```
+
+如果需要每 10 秒读取一次，改为：
+
+```c
+timerDelay_1 = 1000U;
+```
