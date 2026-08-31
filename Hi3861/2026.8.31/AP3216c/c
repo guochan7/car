@@ -1,0 +1,126 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
+
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include "hal_bsp_ap3216c.h"
+
+/* 小车原理图中，LED连接GPIO6 */
+#define LED_GPIO 6
+
+/*
+ * 光照小于等于50：认为天黑，打开灯
+ * 光照大于等于100：认为天亮，关闭灯
+ * 两个阈值不同，可以防止灯在临界值附近不断闪烁
+ */
+#define DARK_ON_THRESHOLD     50
+#define BRIGHT_OFF_THRESHOLD  100
+
+/*
+ * 如果实际测试发现亮灭相反，
+ * 交换下面两个宏的 VALUE0 和 VALUE1。
+ */
+#define LED_ON_LEVEL   WIFI_IOT_GPIO_VALUE1
+#define LED_OFF_LEVEL  WIFI_IOT_GPIO_VALUE0
+
+static void SetCarLight(uint8_t lightOn)
+{
+    if (lightOn) {
+        GpioSetOutputVal(LED_GPIO, LED_ON_LEVEL);
+        printf("Dark environment: car light ON\r\n");
+    } else {
+        GpioSetOutputVal(LED_GPIO, LED_OFF_LEVEL);
+        printf("Bright environment: car light OFF\r\n");
+    }
+}
+
+static void Task1(void *arg)
+{
+    uint16_t ir = 0;
+    uint16_t als = 0;
+    uint16_t ps = 0;
+    uint8_t lightIsOn = 0;
+
+    (void)arg;
+
+    /* 初始化GPIO */
+    GpioInit();
+
+    /* 将GPIO6设置为普通GPIO输出 */
+    IoSetFunc(
+        WIFI_IOT_IO_NAME_GPIO_6,
+        WIFI_IOT_IO_FUNC_GPIO_6_GPIO
+    );
+
+    GpioSetDir(
+        LED_GPIO,
+        WIFI_IOT_GPIO_DIR_OUT
+    );
+
+    /* 开机时先关闭灯 */
+    SetCarLight(0);
+
+    /* 初始化AP3216C三合一传感器 */
+    AP3216C_Init();
+
+    printf("AP3216C automatic light demo started\r\n");
+
+    while (1) {
+        /* 读取红外、环境光和接近传感器数据 */
+        AP3216C_ReadData(&ir, &als, &ps);
+
+        printf(
+            "IR=%u, ALS=%u, PS=%u, LIGHT=%s\r\n",
+            (unsigned int)ir,
+            (unsigned int)als,
+            (unsigned int)ps,
+            lightIsOn ? "ON" : "OFF"
+        );
+
+        /*
+         * 当前灯没亮，而且环境光低于黑暗阈值：
+         * 打开车灯。
+         */
+        if ((!lightIsOn) && (als <= DARK_ON_THRESHOLD)) {
+            lightIsOn = 1;
+            SetCarLight(1);
+        }
+
+        /*
+         * 当前灯已经亮，而且环境光高于明亮阈值：
+         * 关闭车灯。
+         */
+        else if (lightIsOn && (als >= BRIGHT_OFF_THRESHOLD)) {
+            lightIsOn = 0;
+            SetCarLight(0);
+        }
+
+        sleep(1);
+    }
+}
+
+static void i2c_ap3216c_demo(void)
+{
+    osThreadAttr_t options = {0};
+
+    options.name = "ap3216c_light_task";
+    options.attr_bits = 0U;
+    options.cb_mem = NULL;
+    options.cb_size = 0U;
+    options.stack_mem = NULL;
+    options.stack_size = 1024 * 4;
+    options.priority = osPriorityNormal;
+
+    if (osThreadNew(
+            (osThreadFunc_t)Task1,
+            NULL,
+            &options
+        ) == NULL) {
+        printf("Failed to create AP3216C light task!\r\n");
+    }
+}
+
+APP_FEATURE_INIT(i2c_ap3216c_demo);
