@@ -1,0 +1,688 @@
+工程结构
+
+```text
+qst-edge-avoidance-car/
+├── hi3861-edge-controller/
+│   ├── correspondence.c
+│   ├── BUILD.gn
+│   └── app_BUILD.gn.example
+└── stm32-uart-motor-controller/
+    ├── main.c
+    ├── uart_protocol.c
+    ├── uart_protocol.h
+    ├── motor.c
+    ├── motor.h
+    └── qst_board_api.h
+```
+
+## Hi3861：correspondence.c
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
+
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include "wifiiot_uart.h"
+
+#define LEFT_EDGE_SENSOR      WIFI_IOT_GPIO_IDX_5
+#define RIGHT_EDGE_SENSOR     WIFI_IOT_GPIO_IDX_6
+
+/* Change to VALUE0 when the sensors are active-low at an edge. */
+#define EDGE_ACTIVE_LEVEL     WIFI_IOT_GPIO_VALUE1
+
+#define CONTROL_PERIOD_US     20000
+#define EDGE_CONFIRM_COUNT    3
+
+/* One tick equals 20 ms. */
+#define STOP_BEFORE_TURN_TICKS    10
+#define BACKWARD_TICKS            20
+#define TURN_TICKS                30
+#define STOP_AFTER_TURN_TICKS      5
+
+/* Protocol speed is restored by the STM32 side. */
+#define FORWARD_SPEED          60
+#define BACKWARD_SPEED        -50
+#define TURN_SPEED             50
+
+typedef enum {
+    CAR_STATE_FORWARD = 0,
+    CAR_STATE_STOP_AT_EDGE,
+    CAR_STATE_BACK_FROM_EDGE,
+    CAR_STATE_TURN,
+    CAR_STATE_STOP_AFTER_TURN,
+    CAR_STATE_FAULT_STOP
+} CarState;
+
+typedef enum {
+    TURN_DIRECTION_LEFT = 0,
+    TURN_DIRECTION_RIGHT
+} TurnDirection;
+
+static uint8_t uart_sendbuf[6];
+static CarState car_state = CAR_STATE_FORWARD;
+static TurnDirection pending_turn = TURN_DIRECTION_RIGHT;
+static uint16_t state_ticks = 0;
+static uint8_t left_edge_count = 0;
+static uint8_t right_edge_count = 0;
+static uint8_t both_edge_turn_toggle = 0;
+
+static uint8_t EdgeSensor_Read(WifiIotGpioIdx gpio)
+{
+    WifiIotGpioValue value = WIFI_IOT_GPIO_VALUE0;
+
+    /* Fail safe: a read failure is treated as an edge. */
+    if (GpioGetInputVal(gpio, &value) != 0) {
+        return 1;
+    }
+
+    return value == EDGE_ACTIVE_LEVEL;
+}
+
+static uint8_t EdgeConfirm(uint8_t edge_detected, uint8_t *counter)
+{
+    if (edge_detected) {
+        if (*counter < EDGE_CONFIRM_COUNT) {
+            (*counter)++;
+        }
+    } else {
+        *counter = 0;
+    }
+
+    return *counter >= EDGE_CONFIRM_COUNT;
+}
+
+/*
+ * Frame: FC | left direction | left speed |
+ *        right direction | right speed | FD
+ */
+static void stm32motor_control(int motor_a, int motor_b)
+{
+    uint8_t left_direction;
+    uint8_t right_direction;
+
+    if (motor_a < 0) {
+        left_direction = 1;
+        motor_a = -motor_a;
+    } else {
+        left_direction = 0;
+    }
+
+    if (motor_b < 0) {
+        right_direction = 1;
+        motor_b = -motor_b;
+    } else {
+        right_direction = 0;
+    }
+
+    if (motor_a > 150) {
+        motor_a = 150;
+    }
+
+    if (motor_b > 150) {
+        motor_b = 150;
+    }
+
+    uart_sendbuf[0] = 0xFC;
+    uart_sendbuf[1] = left_direction;
+    uart_sendbuf[2] = (uint8_t)motor_a;
+    uart_sendbuf[3] = right_direction;
+    uart_sendbuf[4] = (uint8_t)motor_b;
+    uart_sendbuf[5] = 0xFD;
+
+    UartWrite(WIFI_IOT_UART_IDX_2,
+              (unsigned char *)uart_sendbuf,
+              sizeof(uart_sendbuf));
+}
+
+static void car_stop(void)
+{
+    stm32motor_control(0, 0);
+}
+
+static void car_forward(void)
+{
+    stm32motor_control(FORWARD_SPEED, FORWARD_SPEED);
+}
+
+static void car_backward(void)
+{
+    stm32motor_control(BACKWARD_SPEED, BACKWARD_SPEED);
+}
+
+static void car_turn_left(void)
+{
+    stm32motor_control(-TURN_SPEED, TURN_SPEED);
+}
+
+static void car_turn_right(void)
+{
+    stm32motor_control(TURN_SPEED, -TURN_SPEED);
+}
+
+static void SelectTurnDirection(uint8_t left_edge, uint8_t right_edge)
+{
+    if (left_edge && right_edge) {
+        both_edge_turn_toggle = !both_edge_turn_toggle;
+        pending_turn = both_edge_turn_toggle
+            ? TURN_DIRECTION_RIGHT
+            : TURN_DIRECTION_LEFT;
+        printf("Both sensors detected an edge\r\n");
+    } else if (left_edge) {
+        pending_turn = TURN_DIRECTION_RIGHT;
+        printf("Left edge: turn right\r\n");
+    } else {
+        pending_turn = TURN_DIRECTION_LEFT;
+        printf("Right edge: turn left\r\n");
+    }
+}
+
+static void edge_control_task(void *argument)
+{
+    uint8_t left_edge;
+    uint8_t right_edge;
+
+    (void)argument;
+
+    car_stop();
+    usleep(1000000);
+
+    while (1) {
+        left_edge = EdgeConfirm(
+            EdgeSensor_Read(LEFT_EDGE_SENSOR),
+            &left_edge_count);
+        right_edge = EdgeConfirm(
+            EdgeSensor_Read(RIGHT_EDGE_SENSOR),
+            &right_edge_count);
+
+        switch (car_state) {
+            case CAR_STATE_FORWARD:
+                if (left_edge || right_edge) {
+                    SelectTurnDirection(left_edge, right_edge);
+                    car_stop();
+                    state_ticks = STOP_BEFORE_TURN_TICKS;
+                    car_state = CAR_STATE_STOP_AT_EDGE;
+                } else {
+                    car_forward();
+                }
+                break;
+
+            case CAR_STATE_STOP_AT_EDGE:
+                car_stop();
+                if (state_ticks > 0) {
+                    state_ticks--;
+                } else {
+                    state_ticks = BACKWARD_TICKS;
+                    car_state = CAR_STATE_BACK_FROM_EDGE;
+                }
+                break;
+
+            case CAR_STATE_BACK_FROM_EDGE:
+                car_backward();
+                if (state_ticks > 0) {
+                    state_ticks--;
+                } else {
+                    state_ticks = TURN_TICKS;
+                    car_state = CAR_STATE_TURN;
+                }
+                break;
+
+            case CAR_STATE_TURN:
+                if (pending_turn == TURN_DIRECTION_LEFT) {
+                    car_turn_left();
+                } else {
+                    car_turn_right();
+                }
+
+                if (state_ticks > 0) {
+                    state_ticks--;
+                } else {
+                    car_stop();
+                    state_ticks = STOP_AFTER_TURN_TICKS;
+                    car_state = CAR_STATE_STOP_AFTER_TURN;
+                }
+                break;
+
+            case CAR_STATE_STOP_AFTER_TURN:
+                car_stop();
+                if (state_ticks > 0) {
+                    state_ticks--;
+                } else {
+                    left_edge_count = 0;
+                    right_edge_count = 0;
+                    car_state = CAR_STATE_FORWARD;
+                    printf("Continue forward\r\n");
+                }
+                break;
+
+            case CAR_STATE_FAULT_STOP:
+            default:
+                car_stop();
+                break;
+        }
+
+        usleep(CONTROL_PERIOD_US);
+    }
+}
+
+static void correspondence(void)
+{
+    WifiIotUartAttribute uart_attr2 = {
+        .baudRate = 115200,
+        .dataBits = 8,
+        .stopBits = 1,
+        .parity = 0
+    };
+    osThreadAttr_t attr = {0};
+
+    GpioInit();
+    GpioSetDir(LEFT_EDGE_SENSOR, WIFI_IOT_GPIO_DIR_IN);
+    GpioSetDir(RIGHT_EDGE_SENSOR, WIFI_IOT_GPIO_DIR_IN);
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11,
+              WIFI_IOT_IO_FUNC_GPIO_11_UART2_TXD);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_12,
+              WIFI_IOT_IO_FUNC_GPIO_12_UART2_RXD);
+
+    UartInit(WIFI_IOT_UART_IDX_2, &uart_attr2, NULL);
+
+    attr.name = "edge_control";
+    attr.stack_size = 1024 * 4;
+    attr.priority = 25;
+
+    if (osThreadNew(edge_control_task, NULL, &attr) == NULL) {
+        printf("Failed to create edge control task\r\n");
+        car_stop();
+    }
+}
+
+APP_FEATURE_INIT(correspondence);
+```
+
+## Hi3861：BUILD.gn
+
+```gn
+static_library("correspondence") {
+    sources = [
+        "correspondence.c"
+    ]
+
+    include_dirs = [
+        "//utils/native/lite/include",
+        "//kernel/liteos_m/components/cmsis/2.0",
+        "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+    ]
+}
+```
+
+## Hi3861：上一级 app/BUILD.gn 示例
+
+```gn
+import("//build/lite/config/component/lite_component.gni")
+
+lite_component("app") {
+    features = [
+        "12.0_UART_Correspondence:correspondence",
+    ]
+}
+```
+
+## STM32：main.c
+
+```c
+#include "stm32f10x.h"
+#include "sys.h"
+#include "delay.h"
+#include "qst_board_api.h"
+#include "motor.h"
+#include "uart_protocol.h"
+
+int main(void)
+{
+    Stm32_Clock_Init(9);
+    MY_NVIC_PriorityGroupConfig(2);
+
+    /* Keep the original USART1 for board logging/debugging. */
+    uart_init(115200);
+
+    /* Keep the SWD download/debug interface enabled. */
+    JTAG_Set(SWD_ENABLE);
+
+    /* TIM4 PWM: 72 MHz / 10 / 7200 = 1 kHz. */
+    PWM_Init(7199, 9);
+
+    /* New Hi3861 communication link on PA2/PA3. */
+    USART2_Protocol_Init(115200);
+
+    /* Required by the original delay_ms implementation. */
+    SysTick_Config(72000000u / 1000u);
+
+    Set_Pwm(0, 0);
+
+    while (1) {
+        System_Control_10ms();
+        delay_ms(10);
+    }
+}
+```
+
+## STM32：uart_protocol.h
+
+```c
+#ifndef __UART_PROTOCOL_H
+#define __UART_PROTOCOL_H
+
+#include "stm32f10x.h"
+
+/* PA2 = USART2_TX, PA3 = USART2_RX. */
+void USART2_Protocol_Init(u32 baudrate);
+
+/* Call once every 10 ms. */
+void System_Control_10ms(void);
+
+#endif
+```
+
+## STM32：uart_protocol.c
+
+```c
+#include "uart_protocol.h"
+#include "motor.h"
+#include <string.h>
+
+#define UART_FRAME_LENGTH       6
+#define COMMAND_TIMEOUT_TICKS   30
+#define PWM_SCALE               40
+
+static volatile u8 uart_rx_buf[UART_FRAME_LENGTH];
+static volatile u8 uart_rx_index = 0;
+static volatile u8 car_data[4];
+static volatile u8 uart_frame_ready = 0;
+static volatile u16 command_timeout = COMMAND_TIMEOUT_TICKS;
+
+static int target_motor_a = 0;
+static int target_motor_b = 0;
+
+void USART2_Protocol_Init(u32 baudrate)
+{
+    GPIO_InitTypeDef gpio_init;
+    USART_InitTypeDef usart_init;
+    NVIC_InitTypeDef nvic_init;
+
+    RCC_APB2PeriphClockCmd(
+        RCC_APB2Periph_GPIOA | RCC_APB2Periph_AFIO,
+        ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
+
+    gpio_init.GPIO_Pin = GPIO_Pin_2;
+    gpio_init.GPIO_Speed = GPIO_Speed_50MHz;
+    gpio_init.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_Init(GPIOA, &gpio_init);
+
+    gpio_init.GPIO_Pin = GPIO_Pin_3;
+    gpio_init.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(GPIOA, &gpio_init);
+
+    USART_StructInit(&usart_init);
+    usart_init.USART_BaudRate = baudrate;
+    usart_init.USART_WordLength = USART_WordLength_8b;
+    usart_init.USART_StopBits = USART_StopBits_1;
+    usart_init.USART_Parity = USART_Parity_No;
+    usart_init.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    usart_init.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
+    USART_Init(USART2, &usart_init);
+
+    USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
+
+    nvic_init.NVIC_IRQChannel = USART2_IRQn;
+    nvic_init.NVIC_IRQChannelPreemptionPriority = 2;
+    nvic_init.NVIC_IRQChannelSubPriority = 2;
+    nvic_init.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&nvic_init);
+
+    USART_Cmd(USART2, ENABLE);
+
+    target_motor_a = 0;
+    target_motor_b = 0;
+    Set_Pwm(0, 0);
+}
+
+void USART2_IRQHandler(void)
+{
+    u8 receive_data;
+
+    if (USART_GetITStatus(USART2, USART_IT_RXNE) == RESET) {
+        return;
+    }
+
+    receive_data = (u8)USART_ReceiveData(USART2);
+
+    if (uart_rx_index == 0) {
+        if (receive_data == 0xFC) {
+            uart_rx_buf[0] = receive_data;
+            uart_rx_index = 1;
+        }
+        return;
+    }
+
+    /* 0xFC cannot occur in valid payload data, so it safely resynchronizes. */
+    if (receive_data == 0xFC) {
+        uart_rx_buf[0] = receive_data;
+        uart_rx_index = 1;
+        return;
+    }
+
+    uart_rx_buf[uart_rx_index] = receive_data;
+    uart_rx_index++;
+
+    if (uart_rx_index < UART_FRAME_LENGTH) {
+        return;
+    }
+
+    uart_rx_index = 0;
+
+    if ((uart_rx_buf[0] == 0xFC) &&
+        (uart_rx_buf[5] == 0xFD) &&
+        (uart_rx_buf[1] <= 1) &&
+        (uart_rx_buf[2] <= 150) &&
+        (uart_rx_buf[3] <= 1) &&
+        (uart_rx_buf[4] <= 150)) {
+        car_data[0] = uart_rx_buf[1];
+        car_data[1] = uart_rx_buf[2];
+        car_data[2] = uart_rx_buf[3];
+        car_data[3] = uart_rx_buf[4];
+        uart_frame_ready = 1;
+        command_timeout = 0;
+    }
+
+    memset((void *)uart_rx_buf, 0, sizeof(uart_rx_buf));
+}
+
+void System_Control_10ms(void)
+{
+    u8 left_direction;
+    u8 left_speed;
+    u8 right_direction;
+    u8 right_speed;
+
+    if (uart_frame_ready) {
+        __disable_irq();
+        left_direction = car_data[0];
+        left_speed = car_data[1];
+        right_direction = car_data[2];
+        right_speed = car_data[3];
+        uart_frame_ready = 0;
+        __enable_irq();
+
+        target_motor_a = (int)left_speed;
+        target_motor_b = (int)right_speed;
+
+        if (left_direction == 1) {
+            target_motor_a = -target_motor_a;
+        }
+
+        if (right_direction == 1) {
+            target_motor_b = -target_motor_b;
+        }
+    }
+
+    if (command_timeout < COMMAND_TIMEOUT_TICKS) {
+        command_timeout++;
+    } else {
+        target_motor_a = 0;
+        target_motor_b = 0;
+    }
+
+    Set_Pwm(target_motor_a * PWM_SCALE,
+            target_motor_b * PWM_SCALE);
+}
+```
+
+## STM32：motor.h
+
+```c
+#ifndef __MOTOR_H
+#define __MOTOR_H
+
+#include "stm32f10x.h"
+#include "sys.h"
+
+#define AIN     PBout(14)
+#define BIN     PBout(13)
+#define PWMA    TIM4->CCR1
+#define PWMB    TIM4->CCR2
+
+#define MOTOR_PWM_MAX 7199
+
+void Motor_Init(void);
+void PWM_Init(u16 arr, u16 psc);
+void Set_Pwm(int motor_a, int motor_b);
+u32 myabs(long int value);
+
+#endif
+```
+
+## STM32：motor.c
+
+```c
+#include "motor.h"
+
+void Motor_Init(void)
+{
+    GPIO_InitTypeDef gpio;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+
+    gpio.GPIO_Pin = GPIO_Pin_14 | GPIO_Pin_13;
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOB, &gpio);
+
+    AIN = 0;
+    BIN = 0;
+}
+
+void PWM_Init(u16 arr, u16 psc)
+{
+    GPIO_InitTypeDef gpio;
+    TIM_TimeBaseInitTypeDef time_base;
+    TIM_OCInitTypeDef output_compare;
+
+    Motor_Init();
+
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4, ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+
+    /* TIM4_CH1 = PB6, TIM4_CH2 = PB7. */
+    gpio.GPIO_Pin = GPIO_Pin_6 | GPIO_Pin_7;
+    gpio.GPIO_Mode = GPIO_Mode_AF_PP;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOB, &gpio);
+
+    TIM_TimeBaseStructInit(&time_base);
+    time_base.TIM_Period = arr;
+    time_base.TIM_Prescaler = psc;
+    time_base.TIM_ClockDivision = TIM_CKD_DIV1;
+    time_base.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM4, &time_base);
+
+    TIM_OCStructInit(&output_compare);
+    output_compare.TIM_OCMode = TIM_OCMode_PWM1;
+    output_compare.TIM_OutputState = TIM_OutputState_Enable;
+    output_compare.TIM_Pulse = 0;
+    output_compare.TIM_OCPolarity = TIM_OCPolarity_High;
+
+    TIM_OC1Init(TIM4, &output_compare);
+    TIM_OC2Init(TIM4, &output_compare);
+    TIM_OC1PreloadConfig(TIM4, TIM_OCPreload_Enable);
+    TIM_OC2PreloadConfig(TIM4, TIM_OCPreload_Enable);
+    TIM_ARRPreloadConfig(TIM4, ENABLE);
+    TIM_Cmd(TIM4, ENABLE);
+}
+
+u32 myabs(long int value)
+{
+    if (value < 0) {
+        return (u32)(-value);
+    }
+
+    return (u32)value;
+}
+
+static int LimitMotorPwm(int pwm)
+{
+    if (pwm > MOTOR_PWM_MAX) {
+        return MOTOR_PWM_MAX;
+    }
+
+    if (pwm < -MOTOR_PWM_MAX) {
+        return -MOTOR_PWM_MAX;
+    }
+
+    return pwm;
+}
+
+void Set_Pwm(int motor_a, int motor_b)
+{
+    motor_a = LimitMotorPwm(motor_a);
+    motor_b = LimitMotorPwm(motor_b);
+
+    /* Course wiring maps motor B to TIM4_CH1/AIN. */
+    if (motor_b >= 0) {
+        AIN = 0;
+        PWMA = myabs(motor_b);
+    } else {
+        AIN = 1;
+        PWMA = MOTOR_PWM_MAX - myabs(motor_b);
+    }
+
+    /* Course wiring maps motor A to TIM4_CH2/BIN. */
+    if (motor_a >= 0) {
+        BIN = 0;
+        PWMB = myabs(motor_a);
+    } else {
+        BIN = 1;
+        PWMB = MOTOR_PWM_MAX - myabs(motor_a);
+    }
+}
+```
+
+## STM32：qst_board_api.h
+
+```c
+#ifndef __QST_BOARD_API_H
+#define __QST_BOARD_API_H
+
+#include "stm32f10x.h"
+
+/* Implemented by the original QST board-support project. */
+void Stm32_Clock_Init(u8 pll_multiplier);
+void MY_NVIC_PriorityGroupConfig(u8 group);
+void uart_init(u32 baud_rate);
+void JTAG_Set(u8 mode);
+
+#endif
+```
