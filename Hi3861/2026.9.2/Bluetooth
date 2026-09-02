@@ -1,0 +1,304 @@
+本文保存今天完成的 Hi3861 程序、构建配置及关键修改，方便直接复制到 OpenHarmony 工程。
+
+## 1. `Control.c`
+
+文件位置：
+
+```text
+applications/sample/wifi-iot/app/14.0_Bluetooth_control/Control.c
+```
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <memory.h>
+
+#include "wifiiot_uart.h"
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "wifiiot_gpio.h"
+#include "hi_io.h"
+#include "hi_time.h"
+#include "hi_task.h"
+#include "wifiiot_gpio_ex.h"
+#include "wifiiot_errno.h"
+
+/*
+ * JDY-16 Bluetooth module:
+ *   Hi3861 UART1 TX = GPIO0
+ *   Hi3861 UART1 RX = GPIO1
+ *   factory baud rate = 9600
+ *
+ * STM32 communication:
+ *   Hi3861 UART2 TX = GPIO11 -> STM32 PA10 (USART1 RX)
+ *   Hi3861 UART2 RX = GPIO12 <- STM32 PA9  (USART1 TX)
+ *   baud rate = 115200
+ */
+
+#define BLE_UART           WIFI_IOT_UART_IDX_1
+#define STM32_UART         WIFI_IOT_UART_IDX_2
+#define BLE_RX_BUFFER_SIZE 64U
+#define MOTOR_MAX_VALUE    150
+
+static uint8_t g_uart_send_buffer[6];
+
+static int ClampMotorMagnitude(int value)
+{
+    if (value < 0) {
+        value = -value;
+    }
+    if (value > MOTOR_MAX_VALUE) {
+        value = MOTOR_MAX_VALUE;
+    }
+    return value;
+}
+
+/*
+ * Six-byte course protocol sent to STM32:
+ * [0] 0xFC             frame head
+ * [1] left direction   0=forward, 1=reverse
+ * [2] left magnitude   0..150
+ * [3] right direction  0=forward, 1=reverse
+ * [4] right magnitude  0..150
+ * [5] 0xFD             frame tail
+ */
+static void Stm32MotorControl(int motorA, int motorB)
+{
+    uint8_t directionA = (motorA < 0) ? 1U : 0U;
+    uint8_t directionB = (motorB < 0) ? 1U : 0U;
+
+    g_uart_send_buffer[0] = 0xFCU;
+    g_uart_send_buffer[1] = directionA;
+    g_uart_send_buffer[2] = (uint8_t)ClampMotorMagnitude(motorA);
+    g_uart_send_buffer[3] = directionB;
+    g_uart_send_buffer[4] = (uint8_t)ClampMotorMagnitude(motorB);
+    g_uart_send_buffer[5] = 0xFDU;
+
+    (void)UartWrite(STM32_UART, g_uart_send_buffer, sizeof(g_uart_send_buffer));
+}
+
+static void CarBackward(void)
+{
+    Stm32MotorControl(-150, -150);
+}
+
+static void CarForward(void)
+{
+    Stm32MotorControl(100, 100);
+}
+
+static void CarLeft(void)
+{
+    Stm32MotorControl(-50, 150);
+}
+
+static void CarRight(void)
+{
+    Stm32MotorControl(150, -50);
+}
+
+static void CarStop(void)
+{
+    Stm32MotorControl(0, 0);
+}
+
+static void ExecuteBluetoothCommand(uint8_t command)
+{
+    if ((command >= (uint8_t)'a') && (command <= (uint8_t)'z')) {
+        command = (uint8_t)(command - ((uint8_t)'a' - (uint8_t)'A'));
+    }
+
+    switch (command) {
+        case 'O':
+            CarStop();
+            break;
+        case 'W':
+            CarForward();
+            break;
+        case 'A':
+            CarLeft();
+            break;
+        case 'D':
+            CarRight();
+            break;
+        case 'S':
+            CarBackward();
+            break;
+        case 'I':
+            Stm32MotorControl(100, 100);
+            break;
+        case 'K':
+            Stm32MotorControl(150, 150);
+            break;
+        default:
+            break;
+    }
+}
+
+static void CarModeBluetooth(void *argument)
+{
+    uint8_t bluetoothData[BLE_RX_BUFFER_SIZE];
+    int received;
+    unsigned int index;
+
+    (void)argument;
+    hi_sleep(3000);
+    printf("BLE task running. Send W/A/S/D/O from the phone.\r\n");
+
+    while (1) {
+        (void)memset(bluetoothData, 0, sizeof(bluetoothData));
+        received = UartRead(BLE_UART, bluetoothData, sizeof(bluetoothData));
+        if (received > 0) {
+            for (index = 0; index < (unsigned int)received; ++index) {
+                ExecuteBluetoothCommand(bluetoothData[index]);
+            }
+        }
+        hi_sleep(20);
+    }
+}
+
+static void Control(void)
+{
+    WifiIotUartAttribute bluetoothUart = {
+        .baudRate = 9600,
+        .dataBits = 8,
+        .stopBits = 1,
+        .parity = 0,
+    };
+    WifiIotUartAttribute stm32Uart = {
+        .baudRate = 115200,
+        .dataBits = 8,
+        .stopBits = 1,
+        .parity = 0,
+    };
+    osThreadAttr_t attr;
+    unsigned int result;
+
+    GpioInit();
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_0, WIFI_IOT_IO_FUNC_GPIO_0_UART1_TXD);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_1, WIFI_IOT_IO_FUNC_GPIO_1_UART1_RXD);
+    result = UartInit(BLE_UART, &bluetoothUart, NULL);
+    if (result != WIFI_IOT_SUCCESS) {
+        printf("Failed to initialize Bluetooth UART1: %u\r\n", result);
+        return;
+    }
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11, WIFI_IOT_IO_FUNC_GPIO_11_UART2_TXD);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_12, WIFI_IOT_IO_FUNC_GPIO_12_UART2_RXD);
+    result = UartInit(STM32_UART, &stm32Uart, NULL);
+    if (result != WIFI_IOT_SUCCESS) {
+        printf("Failed to initialize STM32 UART2: %u\r\n", result);
+        return;
+    }
+
+    (void)memset(&attr, 0, sizeof(attr));
+    attr.name = "car_mode_bluetooth";
+    attr.attr_bits = 0U;
+    attr.cb_mem = NULL;
+    attr.cb_size = 0U;
+    attr.stack_mem = NULL;
+    attr.stack_size = 4096U;
+    attr.priority = 25;
+
+    if (osThreadNew(CarModeBluetooth, NULL, &attr) == NULL) {
+        printf("Failed to create car Bluetooth task.\r\n");
+        return;
+    }
+
+    printf("Bluetooth car control ready. UART1=9600, UART2=115200.\r\n");
+}
+
+APP_FEATURE_INIT(Control);
+```
+
+## 2. 模块 `BUILD.gn`
+
+文件位置：
+
+```text
+applications/sample/wifi-iot/app/14.0_Bluetooth_control/BUILD.gn
+```
+
+```gn
+static_library("Control") {
+    sources = [
+        "Control.c",
+    ]
+
+    include_dirs = [
+        "//utils/native/lite/include",
+        "//kernel/liteos_m/components/cmsis/2.0",
+        "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+    ]
+}
+```
+
+## 3. 应用 `BUILD.gn`
+
+文件位置：
+
+```text
+applications/sample/wifi-iot/app/BUILD.gn
+```
+
+```gn
+import("//build/lite/config/component/lite_component.gni")
+
+lite_component("app") {
+    features = [
+        "14.0_Bluetooth_control:Control",
+    ]
+}
+```
+
+## 4. 修改初始化事件数量
+
+文件位置：
+
+```text
+vendor/hisi/hi3861/hi3861/app/wifiiot_app/src/app_main.c
+```
+
+把：
+
+```c
+#define APP_INIT_EVENT_NUM 4
+```
+
+改为：
+
+```c
+#define APP_INIT_EVENT_NUM 7
+```
+
+如果数字前面的空格不同，可以直接在编辑器里定位 `APP_INIT_EVENT_NUM` 后手动修改。
+
+## 5. 代码工作过程
+
+1. `Control()` 初始化 GPIO、UART1 和 UART2。
+2. UART1 以 9600 bit/s 与 JDY-16 通信。
+3. UART2 以 115200 bit/s 与 STM32 通信。
+4. 创建 `CarModeBluetooth` 线程，循环读取手机发来的字符。
+5. `ExecuteBluetoothCommand()` 把字符转换为车辆动作。
+6. `Stm32MotorControl()` 把动作编码成六字节帧并发送给 STM32。
+
+## 6. 关键设计说明
+
+### 大小写兼容
+
+收到小写字母时，程序会先转换为大写，因此 `w` 和 `W` 都可以识别。
+
+### 速度限幅
+
+`ClampMotorMagnitude()` 把电机速度限制在 `0~150`，避免生成超出课程协议范围的数据。
+
+### 差速转向
+
+左转时左轮反转、右轮正转；右转时相反，从而让两轮小车原地或小半径转向。
+
+### 手机没有收到返回数据
+
+当前程序只读取手机指令，没有通过 UART1 回传应答，所以蓝牙调试器显示 RX 为 0 B/s 属于正常现象。
