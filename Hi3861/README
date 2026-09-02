@@ -1,0 +1,203 @@
+# Hi3861 蓝牙遥控无人车
+
+这是我在 2026 年 9 月 2 日完成的 Hi3861 蓝牙遥控无人车实验记录。
+
+本仓库只整理 **Hi3861 一侧**的程序与学习内容。Hi3861 从 JDY-16 蓝牙模块接收手机指令，再通过串口向 STM32 发送课程规定的六字节电机控制帧。
+
+## 当前完成情况
+
+- Hi3861 工程编译成功
+- 固件烧录成功
+- 串口启动信息正常
+- 程序输出：`Bluetooth car control ready. UART1=9600, UART2=115200.`
+- 手机已连接 JDY-16，并能发送 `W/A/S/D/O` 指令
+- Hi3861 侧采用课程原六字节通信协议
+
+> 最终电机动作还要求 STM32 侧使用与六字节帧匹配的接收程序。Hi3861 不直接驱动电机。
+
+## 系统数据链路
+
+```text
+安卓蓝牙调试器
+        |
+        | 蓝牙（字符命令 W/A/S/D/O）
+        v
+JDY-16 蓝牙模块
+        |
+        | UART1，9600 bit/s
+        v
+Hi3861
+        |
+        | UART2，115200 bit/s，六字节协议
+        v
+STM32
+        |
+        | PWM + 方向控制
+        v
+电机驱动模块与左右电机
+```
+
+## Hi3861 接线与串口参数
+
+| 用途 | Hi3861 引脚 | 外部设备 | 参数 |
+| --- | --- | --- | --- |
+| 蓝牙发送 | GPIO0 / UART1_TX | JDY-16 RX | 9600，8N1 |
+| 蓝牙接收 | GPIO1 / UART1_RX | JDY-16 TX | 9600，8N1 |
+| 发往 STM32 | GPIO11 / UART2_TX | STM32 PA10 / USART1_RX | 115200，8N1 |
+| 接收 STM32 | GPIO12 / UART2_RX | STM32 PA9 / USART1_TX | 115200，8N1 |
+
+串口连接时，TX 与 RX 要交叉连接，并确保两块板共地。
+
+## 手机控制字符
+
+手机蓝牙调试器使用文本/ASCII 模式，关闭 HEX，测试时先关闭自动重发。
+
+| 字符 | 动作 |
+| --- | --- |
+| `W` | 前进 |
+| `S` | 后退 |
+| `A` | 左转 |
+| `D` | 右转 |
+| `O` | 停止 |
+| `I` | 普通速度前进 |
+| `K` | 较高速度前进 |
+
+测试时先将车轮架空。单击发送一次 `W` 后，应及时发送一次 `O` 停车。
+
+## 六字节通信协议
+
+Hi3861 发给 STM32 的数据帧如下：
+
+| 字节 | 含义 |
+| --- | --- |
+| 0 | 帧头 `0xFC` |
+| 1 | 左轮方向：`0` 正转，`1` 反转 |
+| 2 | 左轮速度：`0~150` |
+| 3 | 右轮方向：`0` 正转，`1` 反转 |
+| 4 | 右轮速度：`0~150` |
+| 5 | 帧尾 `0xFD` |
+
+例如前进命令会形成：
+
+```text
+FC 00 64 00 64 FD
+```
+
+其中 `0x64` 等于十进制 `100`。
+
+## 文档目录
+
+- [HI3861_CODE.md](HI3861_CODE.md)：完整 Hi3861 源码及构建配置
+- [LEARNING_LOG_2026-09-02.md](LEARNING_LOG_2026-09-02.md)：当天学习日志
+
+## 放入 OpenHarmony 工程
+
+本次使用的源码根目录为：
+
+```text
+/home/harmony/harmony/code/code-1.0
+```
+
+创建目录：
+
+```text
+applications/sample/wifi-iot/app/14.0_Bluetooth_control
+```
+
+在该目录中新建：
+
+```text
+Control.c
+BUILD.gn
+```
+
+然后修改：
+
+```text
+applications/sample/wifi-iot/app/BUILD.gn
+```
+
+只启用本实验：
+
+```gn
+import("//build/lite/config/component/lite_component.gni")
+
+lite_component("app") {
+    features = [
+        "14.0_Bluetooth_control:Control",
+    ]
+}
+```
+
+本实验同时使用两个串口。按课程工程要求，把下面文件中的 `APP_INIT_EVENT_NUM` 改为 `7`：
+
+```text
+vendor/hisi/hi3861/hi3861/app/wifiiot_app/src/app_main.c
+```
+
+## 编译与烧录
+
+在源码根目录执行：
+
+```bash
+python build.py wifiot
+```
+
+成功标志：
+
+```text
+BUILD SUCCESS
+ohos wifiot build success!
+```
+
+烧录文件：
+
+```text
+out/wifiot/Hi3861_wifiiot_app_allinone.bin
+```
+
+烧录完成并复位后，串口应出现：
+
+```text
+Bluetooth car control ready. UART1=9600, UART2=115200.
+BLE task running. Send W/A/S/D/O from the phone.
+```
+
+## 测试顺序
+
+1. 先把小车轮子架空。
+2. 确认 Hi3861 固件已经烧录并复位。
+3. 接上电池并打开小车电源；USB 只给逻辑部分供电时，电机可能无法工作。
+4. 手机连接 `JDY-16`。
+5. 关闭 HEX 和自动重发。
+6. 发送一次 `O`，确保车辆处于停止状态。
+7. 发送一次 `W`，观察车轮。
+8. 再发送一次 `O` 停车。
+
+## 常见问题
+
+### 手机显示已发送，但小车没有动作
+
+依次确认：
+
+1. 电池已连接，小车电源开关已打开。
+2. JDY-16 已连接，手机以 ASCII 文本发送。
+3. Hi3861 启动日志中出现 `Bluetooth car control ready`。
+4. Hi3861 UART2 与 STM32 串口交叉连接且共地。
+5. STM32 程序能识别 `FC ... FD` 六字节帧。
+
+### 手机显示 RX 为 0 B/s
+
+当前 Hi3861 程序没有把收到的字符回传给手机，因此手机 RX 为 0 并不表示发送失败。
+
+### 为什么不用电脑控制器里的 `@F` 协议
+
+`@F/@S` 是前期直连 STM32 时的调试命令。本项目采用课程原协议，即 Hi3861 向 STM32 发送 `0xFC` 开头、`0xFD` 结尾的六字节数据帧。
+
+## 安全提示
+
+- 第一次测试一定将车轮架空。
+- 先准备好停止命令 `O`。
+- 修改接线或切换 USB 路径前先断电。
+- 不要让两个不同电源反向给同一电源端供电。
+- 电机测试需要电池供电，且应确认极性正确。
