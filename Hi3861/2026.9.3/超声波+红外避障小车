@@ -1,0 +1,227 @@
+# 16.0 超声波与红外综合避障小车
+
+## 项目简介
+
+本工程在超声波避障基础上加入底部双路 TCRT5000 红外对管。小车可以绕开墙面等前方障碍物，也可以把黑色胶带视为地面边界：检测到黑带后立即停车，向远离黑带的一侧转弯，再继续直行。
+
+红外检测优先级高于超声波检测。
+
+## 主要功能
+
+- 超声波检测前方障碍物并自动选择左右绕行方向。
+- GPIO13、GPIO14 读取底部左右红外对管。
+- 对红外信号连续采样 5 次，以多数结果过滤抖动。
+- 左侧碰到黑带时右转，右侧碰到黑带时左转。
+- 两侧同时碰到黑带时交替选择左右方向，减少卡死概率。
+- 转弯后向前行驶一小段，离开胶带后恢复检测。
+- 超声波回波无效时安全停车。
+
+## 硬件连接
+
+| 模块 | 信号 | Hi3861 引脚 | 有效电平 |
+| --- | --- | --- | --- |
+| 舵机 | 控制 | GPIO2 | 软件 PWM |
+| 超声波 | TRIG | GPIO7 | 高脉冲触发 |
+| 超声波 | ECHO | GPIO8 | 高电平计时 |
+| STM32 | UART2 TX | GPIO11 | UART |
+| STM32 | UART2 RX | GPIO12 | UART |
+| 左红外对管 | `TC_OUT_L` | GPIO13 | 低电平表示黑色 |
+| 右红外对管 | `TC_OUT_R` | GPIO14 | 低电平表示黑色 |
+
+红外有效电平已经按照开发板自带 `2.0_TCRT_Timer/TCRT.c` 示例设置：
+
+```c
+#define INFRARED_BLACK_LEVEL WIFI_IOT_GPIO_VALUE0
+```
+
+## 工程结构
+
+```text
+16.0_Ultrasonic_Infrared_Avoidance/
+├── BUILD.gn
+├── README.md
+└── Ultrasonic_Infrared_Avoidance.c
+```
+
+## 综合控制流程
+
+```text
+读取左右红外对管
+    ├── 任意一路检测到黑带
+    │       ↓
+    │     立即停车
+    │       ↓
+    │     向远离黑带的一侧转弯
+    │       ↓
+    │     向前离开胶带并恢复检测
+    │
+    └── 未检测到黑带
+            ↓
+        测量前方距离
+            ├── 回波无效 → 安全停车
+            ├── 距离 > 25 cm → 直行
+            └── 距离 ≤ 25 cm → 左右扫描并绕障
+```
+
+## 红外滤波代码
+
+```c
+static InfraredState ReadInfraredFiltered(void)
+{
+    WifiIotGpioValue leftValue = WIFI_IOT_GPIO_VALUE0;
+    WifiIotGpioValue rightValue = WIFI_IOT_GPIO_VALUE0;
+    InfraredState state = {0, 0};
+    int leftVotes = 0;
+    int rightVotes = 0;
+    int i;
+
+    for (i = 0; i < INFRARED_SAMPLE_COUNT; ++i) {
+        (void)GpioGetInputVal(INFRARED_LEFT_GPIO, &leftValue);
+        (void)GpioGetInputVal(INFRARED_RIGHT_GPIO, &rightValue);
+
+        if (leftValue == INFRARED_BLACK_LEVEL) {
+            ++leftVotes;
+        }
+        if (rightValue == INFRARED_BLACK_LEVEL) {
+            ++rightVotes;
+        }
+        hi_sleep(INFRARED_SAMPLE_DELAY_MS);
+    }
+
+    state.leftBlack = (leftVotes >= 3);
+    state.rightBlack = (rightVotes >= 3);
+    return state;
+}
+```
+
+## 黑胶带处理逻辑
+
+```c
+if (state.leftBlack && !state.rightBlack) {
+    CarTurnRight();
+} else if (!state.leftBlack && state.rightBlack) {
+    CarTurnLeft();
+} else if (g_turnLeftNext) {
+    CarTurnLeft();
+    g_turnLeftNext = 0;
+} else {
+    CarTurnRight();
+    g_turnLeftNext = 1;
+}
+
+hi_sleep(TAPE_TURN_TIME_MS);
+CarStop();
+hi_sleep(100U);
+CarForward();
+hi_sleep(TAPE_CLEAR_TIME_MS);
+```
+
+## 主循环核心逻辑
+
+```c
+for (;;) {
+    infrared = ReadInfraredFiltered();
+    if (infrared.leftBlack || infrared.rightBlack) {
+        HandleBlackTape(infrared);
+        continue;
+    }
+
+    frontDistance = MeasureDistanceFiltered();
+    if (frontDistance < 0.0f) {
+        CarStop();
+        hi_sleep(250U);
+        continue;
+    }
+
+    if (frontDistance <= SAFE_DISTANCE_CM) {
+        AvoidObstacle();
+    } else {
+        CarForward();
+        hi_sleep(CONTROL_PERIOD_MS);
+    }
+}
+```
+
+## 关键参数
+
+```c
+#define SAFE_DISTANCE_CM           25.0f
+#define FORWARD_SPEED              90
+#define REVERSE_SPEED              80
+#define TURN_SPEED                 85
+#define OBSTACLE_TURN_TIME_MS      500U
+#define TAPE_STOP_TIME_MS          150U
+#define TAPE_TURN_TIME_MS          520U
+#define TAPE_CLEAR_TIME_MS         260U
+#define INFRARED_SAMPLE_COUNT      5
+#define INFRARED_SAMPLE_DELAY_MS   4U
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `SAFE_DISTANCE_CM` | 超声波避障距离 |
+| `OBSTACLE_TURN_TIME_MS` | 遇到墙时的转向时间 |
+| `TAPE_STOP_TIME_MS` | 检测到黑带后的停车时间 |
+| `TAPE_TURN_TIME_MS` | 黑带转向时间 |
+| `TAPE_CLEAR_TIME_MS` | 转弯后向前离开胶带的时间 |
+| `INFRARED_SAMPLE_COUNT` | 每次红外判断的采样次数 |
+
+## BUILD.gn
+
+```gn
+static_library("Ultrasonic_Infrared_Avoidance") {
+    sources = [
+        "Ultrasonic_Infrared_Avoidance.c",
+    ]
+
+    include_dirs = [
+        "//utils/native/lite/include",
+        "//kernel/liteos_m/components/cmsis/2.0",
+        "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+    ]
+}
+```
+
+父目录 `applications/sample/wifi-iot/app/BUILD.gn` 应写为：
+
+```gn
+import("//build/lite/config/component/lite_component.gni")
+
+lite_component("app") {
+    features = [
+        "16.0_Ultrasonic_Infrared_Avoidance:Ultrasonic_Infrared_Avoidance",
+    ]
+}
+```
+
+## 编译
+
+```bash
+python build.py wifiiot
+```
+
+## 实车调试顺序
+
+1. 将车轮架空并上电，确认左右轮方向正确。
+2. 打开串口日志，确认前方距离数值正常。
+3. 用白纸和黑胶带分别靠近左右传感器，确认黑带对应低电平。
+4. 在地面只测试黑带转向，调整 `TAPE_TURN_TIME_MS`。
+5. 最后同时测试黑带边界和墙面障碍物。
+
+## 常见问题
+
+### 放在白色地面也一直转弯
+
+调节底部两个红外模块的电位器，使传感器在白色地面输出高电平、黑色胶带输出低电平。也可以先运行开发板自带的 `2.0_TCRT_Timer` 示例查看左右传感器状态。
+
+### 转弯后仍然重复触发黑带
+
+适当增加 `TAPE_TURN_TIME_MS` 或 `TAPE_CLEAR_TIME_MS`。
+
+### 遇墙时停车太晚
+
+提高 `SAFE_DISTANCE_CM`，或降低 `FORWARD_SPEED`。
+
+### 舵机左右扫描方向相反
+
+交换 `SERVO_LEFT_US` 和 `SERVO_RIGHT_US` 的数值。
