@@ -1,0 +1,182 @@
+# 15.0 超声波自动避障小车
+
+## 项目简介
+
+本工程让 QST 鸿蒙小车自动前进，并使用超声波模块检测前方障碍物。距离过近时，小车先停车、短暂后退，再控制舵机向左右扫描，选择空间较大的一侧转向。
+
+## 主要功能
+
+- 三次超声波采样取有效平均值，降低单次回波抖动。
+- 前方距离大于安全距离时直行。
+- 前方距离小于或等于安全距离时自动绕障。
+- 左右距离都无效时立即停车，避免盲目前进。
+- 通过 UART2 向 STM32 发送左右轮速度和方向。
+- 上电后延迟 3 秒启动，便于安全放置小车。
+
+## 硬件连接
+
+| 模块 | 信号 | Hi3861 引脚 |
+| --- | --- | --- |
+| 舵机 | PWM 软件脉冲 | GPIO2 |
+| 超声波 | TRIG | GPIO7 |
+| 超声波 | ECHO | GPIO8 |
+| STM32 | UART2 TX | GPIO11 |
+| STM32 | UART2 RX | GPIO12 |
+
+## 工程结构
+
+```text
+15.0_Ultrasonic_Avoidance/
+├── BUILD.gn
+├── README.md
+└── Ultrasonic_Avoidance.c
+```
+
+## 控制流程
+
+```text
+上电初始化
+    ↓
+舵机回到中间位置
+    ↓
+等待 3 秒
+    ↓
+测量前方距离
+    ├── 回波无效 → 安全停车
+    ├── 距离 > 25 cm → 直行
+    └── 距离 ≤ 25 cm
+            ↓
+       停车并后退
+            ↓
+       测量左、右距离
+            ↓
+       朝空间较大方向转弯
+```
+
+## 关键参数
+
+在 `Ultrasonic_Avoidance.c` 顶部可以调节：
+
+```c
+#define SAFE_DISTANCE_CM           25.0f
+#define FORWARD_SPEED              90
+#define REVERSE_SPEED              80
+#define TURN_SPEED                 85
+#define REVERSE_TIME_MS            350U
+#define TURN_TIME_MS               500U
+#define CONTROL_PERIOD_MS          80U
+#define START_DELAY_MS             3000U
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `SAFE_DISTANCE_CM` | 触发避障的前方距离 |
+| `FORWARD_SPEED` | 直行速度 |
+| `REVERSE_SPEED` | 后退速度 |
+| `TURN_SPEED` | 原地转向速度 |
+| `REVERSE_TIME_MS` | 避障时后退时间 |
+| `TURN_TIME_MS` | 避障转向时间 |
+
+## 电机控制帧
+
+Hi3861 通过 UART2 向 STM32 发送 6 字节控制帧：
+
+```c
+static void SetMotorSpeed(int left, int right)
+{
+    g_motorFrame[0] = 0xFCU;
+    g_motorFrame[1] = (left < 0) ? 1U : 0U;
+    g_motorFrame[2] = (uint8_t)ClampMotorMagnitude(left);
+    g_motorFrame[3] = (right < 0) ? 1U : 0U;
+    g_motorFrame[4] = (uint8_t)ClampMotorMagnitude(right);
+    g_motorFrame[5] = 0xFDU;
+    (void)UartWrite(STM32_UART, g_motorFrame, sizeof(g_motorFrame));
+}
+```
+
+帧格式为：
+
+```text
+0xFC | 左轮方向 | 左轮速度 | 右轮方向 | 右轮速度 | 0xFD
+```
+
+## 超声波测距
+
+```c
+GpioSetOutputVal(ULTRASONIC_TRIG_GPIO, WIFI_IOT_GPIO_VALUE0);
+hi_udelay(2U);
+GpioSetOutputVal(ULTRASONIC_TRIG_GPIO, WIFI_IOT_GPIO_VALUE1);
+hi_udelay(10U);
+GpioSetOutputVal(ULTRASONIC_TRIG_GPIO, WIFI_IOT_GPIO_VALUE0);
+
+distanceCm = ((float)echoTimeUs * 0.034f) / 2.0f;
+```
+
+代码为等待 ECHO 高、低电平都设置了 30 ms 超时，避免传感器异常时程序永久阻塞。
+
+## 主循环核心逻辑
+
+```c
+for (;;) {
+    frontDistance = MeasureDistanceFiltered();
+
+    if (frontDistance < 0.0f) {
+        CarStop();
+        printf("[avoid] front echo timeout; safety stop\r\n");
+        hi_sleep(250U);
+        continue;
+    }
+
+    if (frontDistance <= SAFE_DISTANCE_CM) {
+        AvoidObstacle();
+    } else {
+        CarForward();
+        hi_sleep(CONTROL_PERIOD_MS);
+    }
+}
+```
+
+## BUILD.gn
+
+```gn
+static_library("Ultrasonic_Avoidance") {
+    sources = [
+        "Ultrasonic_Avoidance.c",
+    ]
+
+    include_dirs = [
+        "//utils/native/lite/include",
+        "//kernel/liteos_m/components/cmsis/2.0",
+        "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+    ]
+}
+```
+
+父目录 `applications/sample/wifi-iot/app/BUILD.gn` 应写为：
+
+```gn
+import("//build/lite/config/component/lite_component.gni")
+
+lite_component("app") {
+    features = [
+        "15.0_Ultrasonic_Avoidance:Ultrasonic_Avoidance",
+    ]
+}
+```
+
+## 编译
+
+在 OpenHarmony 源码根目录运行：
+
+```bash
+python build.py wifiiot
+```
+
+成功时终端会显示：
+
+```text
+BUILD SUCCESS
+ohos wifiiot build success!
+```
+
+
