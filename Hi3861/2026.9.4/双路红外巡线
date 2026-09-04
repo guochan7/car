@@ -1,0 +1,732 @@
+# 完整工程代码：17.0 双路红外巡线
+
+整理日期：2026-09-04。
+
+本文完整收录本包的构建配置、控制参数、接口、状态机、硬件任务和测试源码，不是节选。代码与同包对应源文件保持一致。Markdown 方便阅读和复制，不会直接参与固件编译；后续修改应同步更新对应源文件与本文。
+
+## 使用说明
+
+目标路线为第一岔路左转、第二岔路右转。用户报告黑带为 1、白带与地砖为 0、岔路为 1,1，这些是软件归一化值。默认不驱动电机，未完成 SDK 编译、测试执行或实车验证。有关尺寸、启动位置、超声波保护和误判风险，请先阅读 [README](README.md) 及 [详细工程说明](17.0_TwoSensor_LineFollowing/README.md)。
+
+## 父级构建选择
+
+将组件放入 SDK 的 `applications/sample/wifi-iot/app/` 后，修改父级 `BUILD.gn` 中的 `features`，保留其他必要内容：
+
+```gn
+features = [
+  "17.0_TwoSensor_LineFollowing:TwoSensor_LineFollowing",
+]
+```
+
+下面各节标题是相对组件目录的文件名，不要把所有代码拼到同一个 C 文件中。
+
+## BUILD.gn
+
+组件构建配置。对应文件：[BUILD.gn](17.0_TwoSensor_LineFollowing/BUILD.gn)。
+
+```gn
+static_library("TwoSensor_LineFollowing") {
+  sources = [
+    "LineFollowing.c",
+    "line_control.c",
+  ]
+  include_dirs = [
+    "//utils/native/lite/include",
+    "//kernel/liteos_m/components/cmsis/2.0",
+    "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+  ]
+}
+```
+
+## line_config.h
+
+参数与默认禁用电机开关。对应文件：[line_config.h](17.0_TwoSensor_LineFollowing/line_config.h)。
+
+```c
+#ifndef LINE_CONFIG_H
+#define LINE_CONFIG_H
+
+/* First flash is a stationary sensor check. Set to 1 only after bench tests. */
+#define LINE_MOTORS_ENABLED       0
+#define LINE_BASE_SPEED           45
+#define LINE_INNER_SPEED          20
+#define LINE_OUTER_SPEED          55
+#define LINE_STOP_DISTANCE_CM     25.0f
+#define LINE_SONAR_MAX_AGE_US      250000U
+#define LINE_MAX_RUN_US           10000000U
+/* Heuristics, NOT reliable lost-line detectors. May stop on a valid straight. */
+#define LINE_MAX_WHITE_US         4000000U
+#define LINE_MAX_CORRECTION_US    1000000U
+#define LINE_STABLE_SAMPLES       3U
+
+/* Experimental route: first confirmed junction LEFT, second RIGHT.
+ * Durations are test starting points, not calibrated turn angles.
+ */
+#define LINE_JUNCTION_CONFIRM_US  30000U
+#define LINE_ROUTE_TURN_SPEED     35
+#define LINE_ROUTE_MIN_TURN_US    120000U
+#define LINE_ROUTE_MAX_TURN_US    1500000U
+#define LINE_CAPTURE_BLACK_US     30000U
+#define LINE_CAPTURE_WHITE_US     80000U
+#define LINE_JUNCTION_CLEAR_US   300000U
+#define LINE_JUNCTION_EXIT_US   1500000U
+
+#endif
+```
+
+## line_control.h
+
+控制器接口与状态。对应文件：[line_control.h](17.0_TwoSensor_LineFollowing/line_control.h)。
+
+```c
+#ifndef LINE_CONTROL_H
+#define LINE_CONTROL_H
+#include <stdint.h>
+
+typedef enum {
+    LINE_FORWARD = 0, LINE_LEFT, LINE_RIGHT,
+    LINE_JUNCTION_WAIT, LINE_ROUTE_LEFT, LINE_ROUTE_RIGHT, LINE_JUNCTION_EXIT,
+    LINE_STOP_SENSOR = 16, LINE_STOP_SONAR, LINE_STOP_OBSTACLE,
+    LINE_STOP_AMBIGUOUS, LINE_STOP_WHITE_TIMEOUT,
+    LINE_STOP_CORRECTION_TIMEOUT, LINE_STOP_RUN_TIMEOUT,
+    LINE_STOP_TURN_TIMEOUT, LINE_STOP_EXIT_TIMEOUT
+} LineReason;
+
+typedef enum { ROUTE_FOLLOW, ROUTE_CONFIRM, ROUTE_TURN, ROUTE_EXIT } RoutePhase;
+
+typedef struct {
+    uint32_t nowUs;
+    int sensorsValid;
+    int leftBlack;
+    int rightBlack;
+    int sonarValid;
+    float distanceCm;
+    uint32_t sonarAgeUs;
+} LineInput;
+
+typedef struct { int left; int right; LineReason reason; } LineOutput;
+
+typedef struct {
+    uint32_t startUs;
+    uint32_t stateSinceUs;
+    unsigned int candidate;
+    unsigned int count;
+    unsigned int stable;
+    int ready;
+    LineReason latch;
+    RoutePhase phase;
+    unsigned int junctionCount;
+    uint32_t phaseSinceUs;
+    uint32_t captureSinceUs;
+    uint32_t clearSinceUs;
+    unsigned int captureStage;
+    unsigned int captureSide;
+} LineController;
+
+void LineInit(LineController *controller, uint32_t nowUs);
+LineOutput LineStep(LineController *controller, const LineInput *input);
+#endif
+```
+
+## line_control.c
+
+巡线和岔路状态机。对应文件：[line_control.c](17.0_TwoSensor_LineFollowing/line_control.c)。
+
+```c
+#include "line_control.h"
+#include "line_config.h"
+
+static LineOutput Stop(LineController *c, LineReason reason)
+{
+    LineOutput out = {0, 0, reason};
+    c->latch = reason;
+    return out;
+}
+
+void LineInit(LineController *c, uint32_t nowUs)
+{
+    c->startUs = nowUs;
+    c->stateSinceUs = nowUs;
+    c->candidate = 0U;
+    c->count = 0U;
+    c->stable = 0U;
+    c->ready = 0;
+    c->latch = LINE_FORWARD;
+    c->phase = ROUTE_FOLLOW;
+    c->junctionCount = 0U;
+    c->phaseSinceUs = nowUs;
+    c->captureSinceUs = nowUs;
+    c->clearSinceUs = nowUs;
+    c->captureStage = 0U;
+    c->captureSide = 0U;
+}
+
+static LineOutput Hold(LineReason reason)
+{
+    LineOutput out = {0, 0, reason};
+    return out;
+}
+
+/* Reacquisition is a heuristic: after a minimum turn, require stable single
+ * black followed by stable white. White alone can also be tile, so this does
+ * NOT prove branch identity. Keep the turn bounded and test with supervision.
+ */
+static LineOutput RouteTurn(LineController *c, const LineInput *in, unsigned int raw)
+{
+    LineOutput out = {-LINE_ROUTE_TURN_SPEED, LINE_ROUTE_TURN_SPEED, LINE_ROUTE_LEFT};
+    uint32_t elapsed = (uint32_t)(in->nowUs - c->phaseSinceUs);
+    if (elapsed >= LINE_ROUTE_MAX_TURN_US) {
+        return Stop(c, LINE_STOP_TURN_TIMEOUT);
+    }
+    if (c->junctionCount == 2U) {
+        out.left = LINE_ROUTE_TURN_SPEED;
+        out.right = -LINE_ROUTE_TURN_SPEED;
+        out.reason = LINE_ROUTE_RIGHT;
+    }
+    if (elapsed < LINE_ROUTE_MIN_TURN_US) { return out; }
+    if (raw == 3U) {
+        c->captureStage = 0U;
+    } else if (raw == 1U || raw == 2U) {
+        if (c->captureStage == 0U || c->captureStage == 3U || c->captureSide != raw) {
+            c->captureStage = 1U;
+            c->captureSide = raw;
+            c->captureSinceUs = in->nowUs;
+        } else if (c->captureStage == 1U &&
+            (uint32_t)(in->nowUs - c->captureSinceUs) >= LINE_CAPTURE_BLACK_US) {
+            c->captureStage = 2U;
+        }
+    } else if (c->captureStage == 2U) {
+        c->captureStage = 3U;
+        c->captureSinceUs = in->nowUs;
+    } else if (c->captureStage == 3U) {
+        /* Hold the heading while confirming white instead of rotating away. */
+        if ((uint32_t)(in->nowUs - c->captureSinceUs) >= LINE_CAPTURE_WHITE_US) {
+            c->phase = ROUTE_EXIT;
+            c->phaseSinceUs = in->nowUs;
+            c->clearSinceUs = in->nowUs;
+            c->captureStage = 0U;
+            c->stable = 0U;
+            c->candidate = 0U;
+            c->count = LINE_STABLE_SAMPLES;
+            c->stateSinceUs = in->nowUs;
+        }
+        return Hold(LINE_JUNCTION_EXIT);
+    } else {
+        c->captureStage = 0U;
+    }
+    if (c->captureStage == 3U) { return Hold(LINE_JUNCTION_EXIT); }
+    return out;
+}
+
+LineOutput LineStep(LineController *c, const LineInput *in)
+{
+    unsigned int raw;
+    LineOutput out = {LINE_BASE_SPEED, LINE_BASE_SPEED, LINE_FORWARD};
+    if (c->latch >= LINE_STOP_SENSOR) {
+        return Stop(c, c->latch);
+    }
+    if (!in->sensorsValid) {
+        return Stop(c, LINE_STOP_SENSOR);
+    }
+    /* NaN also fails this comparison. Never interpret missing echo as clear. */
+    if (!in->sonarValid || !(in->distanceCm > 0.0f) ||
+        in->sonarAgeUs > LINE_SONAR_MAX_AGE_US) {
+        return Stop(c, LINE_STOP_SONAR);
+    }
+    if (in->distanceCm <= LINE_STOP_DISTANCE_CM) {
+        return Stop(c, LINE_STOP_OBSTACLE);
+    }
+    if ((uint32_t)(in->nowUs - c->startUs) >= LINE_MAX_RUN_US) {
+        return Stop(c, LINE_STOP_RUN_TIMEOUT);
+    }
+    raw = (in->leftBlack ? 1U : 0U) | (in->rightBlack ? 2U : 0U);
+    if (c->phase == ROUTE_TURN) { return RouteTurn(c, in, raw); }
+    if (c->phase == ROUTE_CONFIRM) {
+        if (raw != 3U) {
+            c->phase = ROUTE_FOLLOW;
+            return Hold(LINE_JUNCTION_WAIT);
+        }
+        if ((uint32_t)(in->nowUs - c->phaseSinceUs) >= LINE_JUNCTION_CONFIRM_US) {
+            ++c->junctionCount;
+            c->phase = ROUTE_TURN;
+            c->phaseSinceUs = in->nowUs;
+            c->captureStage = 0U;
+            return RouteTurn(c, in, raw);
+        }
+        return Hold(LINE_JUNCTION_WAIT);
+    }
+    if (c->phase == ROUTE_EXIT) {
+        if ((uint32_t)(in->nowUs - c->phaseSinceUs) >= LINE_JUNCTION_EXIT_US) {
+            return Stop(c, LINE_STOP_EXIT_TIMEOUT);
+        }
+        /* Never count repeated double-black while still leaving this junction. */
+        if (raw == 3U) {
+            c->captureStage = 0U;
+            return Hold(LINE_JUNCTION_EXIT);
+        }
+        if (c->captureStage == 0U) {
+            c->captureStage = 1U;
+            c->clearSinceUs = in->nowUs;
+        }
+        if ((uint32_t)(in->nowUs - c->clearSinceUs) >= LINE_JUNCTION_CLEAR_US) {
+            c->phase = ROUTE_FOLLOW;
+        }
+    }
+    if (raw == 3U) {
+        /* Starting on a bar is unsafe; after two turns, stop at any further bar.
+         * Neither case is declared a verified finish.
+         */
+        if (!c->ready || c->junctionCount >= 2U) {
+            return Stop(c, LINE_STOP_AMBIGUOUS);
+        }
+        c->phase = ROUTE_CONFIRM;
+        c->phaseSinceUs = in->nowUs;
+        return Hold(LINE_JUNCTION_WAIT);
+    }
+    if (raw != c->candidate) {
+        c->candidate = raw;
+        c->count = 1U;
+    } else if (c->count < LINE_STABLE_SAMPLES) {
+        ++c->count;
+    }
+    if (c->count >= LINE_STABLE_SAMPLES && (!c->ready || c->stable != raw)) {
+        c->stable = raw;
+        c->stateSinceUs = in->nowUs;
+        c->ready = 1;
+    }
+    if (c->stable == 0U) {
+        if ((uint32_t)(in->nowUs - c->stateSinceUs) >= LINE_MAX_WHITE_US) {
+            return Stop(c, LINE_STOP_WHITE_TIMEOUT);
+        }
+    } else {
+        if ((uint32_t)(in->nowUs - c->stateSinceUs) >= LINE_MAX_CORRECTION_US) {
+            return Stop(c, LINE_STOP_CORRECTION_TIMEOUT);
+        }
+        if (c->stable == 1U) {
+            out.left = LINE_INNER_SPEED;
+            out.right = LINE_OUTER_SPEED;
+            out.reason = LINE_LEFT;
+        } else {
+            out.left = LINE_OUTER_SPEED;
+            out.right = LINE_INNER_SPEED;
+            out.reason = LINE_RIGHT;
+        }
+    }
+    /* Wait stationary for the first stable reading. */
+    if (!c->ready) {
+        out.left = 0;
+        out.right = 0;
+    }
+    return out;
+}
+```
+
+## LineFollowing.c
+
+硬件接口与任务入口。对应文件：[LineFollowing.c](17.0_TwoSensor_LineFollowing/LineFollowing.c)。
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "hi_io.h"
+#include "hi_time.h"
+#include "hi_task.h"
+#include "wifiiot_errno.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include "wifiiot_uart.h"
+#include "line_config.h"
+#include "line_control.h"
+
+#define LEFT_GPIO       13
+#define RIGHT_GPIO      14
+#define TRIG_GPIO       7
+#define ECHO_GPIO       8
+#define SERVO_GPIO      2
+#define LEFT_BLACK      WIFI_IOT_GPIO_VALUE0
+#define RIGHT_BLACK     WIFI_IOT_GPIO_VALUE0
+#define MOTOR_UART      WIFI_IOT_UART_IDX_2
+#define SONAR_PERIOD_US 100000U
+#define SONAR_TIMEOUT_US 12000U
+
+/* Existing QST STM32 protocol. Success means sent, NOT motor acknowledgement. */
+static unsigned int MotorWrite(int left, int right)
+{
+    uint8_t frame[6] = {0xFCU, 0U, 0U, 0U, 0U, 0xFDU};
+    if (left < 0) { frame[1] = 1U; left = -left; }
+    if (right < 0) { frame[3] = 1U; right = -right; }
+    if (left > 150) { left = 150; }
+    if (right > 150) { right = 150; }
+    frame[2] = (uint8_t)left;
+    frame[4] = (uint8_t)right;
+    return UartWrite(MOTOR_UART, frame, sizeof(frame));
+}
+
+static int ReadIR(int *left, int *right)
+{
+    WifiIotGpioValue l;
+    WifiIotGpioValue r;
+    if (GpioGetInputVal(LEFT_GPIO, &l) != WIFI_IOT_SUCCESS ||
+        GpioGetInputVal(RIGHT_GPIO, &r) != WIFI_IOT_SUCCESS) {
+        return 0;
+    }
+    *left = (l == LEFT_BLACK);
+    *right = (r == RIGHT_BLACK);
+    return 1;
+}
+
+/* Single bounded measurement: at most about 24 ms plus API/scheduling cost.
+ * Called every 100 ms, not three consecutive readings in the steering loop.
+ * The sensor must face forward; 1500 us is a starting calibration only.
+ */
+static float FrontDistance(void)
+{
+    WifiIotGpioValue echo;
+    uint32_t start;
+    uint32_t pulse;
+    float cm;
+    if (GpioGetInputVal(ECHO_GPIO, &echo) != WIFI_IOT_SUCCESS ||
+        echo != WIFI_IOT_GPIO_VALUE0) { return -1.0f; }
+    if (GpioSetOutputVal(TRIG_GPIO, WIFI_IOT_GPIO_VALUE0) != WIFI_IOT_SUCCESS) {
+        return -1.0f;
+    }
+    hi_udelay(2U);
+    if (GpioSetOutputVal(TRIG_GPIO, WIFI_IOT_GPIO_VALUE1) != WIFI_IOT_SUCCESS) {
+        return -1.0f;
+    }
+    hi_udelay(10U);
+    if (GpioSetOutputVal(TRIG_GPIO, WIFI_IOT_GPIO_VALUE0) != WIFI_IOT_SUCCESS) {
+        return -1.0f;
+    }
+    start = hi_get_us();
+    do {
+        if (GpioGetInputVal(ECHO_GPIO, &echo) != WIFI_IOT_SUCCESS ||
+            (uint32_t)(hi_get_us() - start) >= SONAR_TIMEOUT_US) {
+            return -1.0f;
+        }
+    } while (echo == WIFI_IOT_GPIO_VALUE0);
+    pulse = hi_get_us();
+    do {
+        if (GpioGetInputVal(ECHO_GPIO, &echo) != WIFI_IOT_SUCCESS ||
+            (uint32_t)(hi_get_us() - pulse) >= SONAR_TIMEOUT_US) {
+            return -1.0f;
+        }
+    } while (echo == WIFI_IOT_GPIO_VALUE1);
+    cm = (float)(uint32_t)(hi_get_us() - pulse) * 0.017f;
+    /* Pulses below the usable range are invalid, hence stop. */
+    return (cm >= 2.0f && cm <= 200.0f) ? cm : -1.0f;
+}
+
+#define CHECK(call) do { unsigned int rc = (call); \
+    if (rc != WIFI_IOT_SUCCESS) { return rc; } } while (0)
+
+static unsigned int HardwareInit(void)
+{
+    WifiIotUartAttribute uart = {
+        .baudRate = 115200U, .dataBits = 8, .stopBits = 1, .parity = 0
+    };
+    unsigned int i;
+    CHECK(GpioInit());
+    CHECK(IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11, WIFI_IOT_IO_FUNC_GPIO_11_UART2_TXD));
+    CHECK(IoSetFunc(WIFI_IOT_IO_NAME_GPIO_12, WIFI_IOT_IO_FUNC_GPIO_12_UART2_RXD));
+    CHECK(UartInit(MOTOR_UART, &uart, NULL));
+    CHECK(MotorWrite(0, 0));
+    CHECK(IoSetFunc(WIFI_IOT_IO_NAME_GPIO_13, WIFI_IOT_IO_FUNC_GPIO_13_GPIO));
+    CHECK(IoSetFunc(WIFI_IOT_IO_NAME_GPIO_14, WIFI_IOT_IO_FUNC_GPIO_14_GPIO));
+    CHECK(GpioSetDir(LEFT_GPIO, WIFI_IOT_GPIO_DIR_IN));
+    CHECK(GpioSetDir(RIGHT_GPIO, WIFI_IOT_GPIO_DIR_IN));
+    CHECK(IoSetFunc(WIFI_IOT_IO_NAME_GPIO_7, WIFI_IOT_IO_FUNC_GPIO_7_GPIO));
+    CHECK(IoSetFunc(WIFI_IOT_IO_NAME_GPIO_8, WIFI_IOT_IO_FUNC_GPIO_8_GPIO));
+    CHECK(GpioSetDir(TRIG_GPIO, WIFI_IOT_GPIO_DIR_OUT));
+    CHECK(GpioSetDir(ECHO_GPIO, WIFI_IOT_GPIO_DIR_IN));
+    CHECK(GpioSetOutputVal(TRIG_GPIO, WIFI_IOT_GPIO_VALUE0));
+    CHECK(IoSetFunc(WIFI_IOT_IO_NAME_GPIO_2, WIFI_IOT_IO_FUNC_GPIO_2_GPIO));
+    CHECK(GpioSetDir(SERVO_GPIO, WIFI_IOT_GPIO_DIR_OUT));
+    for (i = 0U; i < 15U; ++i) {
+        CHECK(GpioSetOutputVal(SERVO_GPIO, WIFI_IOT_GPIO_VALUE1));
+        hi_udelay(1500U);
+        CHECK(GpioSetOutputVal(SERVO_GPIO, WIFI_IOT_GPIO_VALUE0));
+        hi_udelay(18500U);
+    }
+    return WIFI_IOT_SUCCESS;
+}
+
+static void LineTask(void *argument)
+{
+    LineController controller;
+    LineInput input = {0};
+    LineOutput output = {0, 0, LINE_FORWARD};
+    uint32_t sonarStart;
+    uint32_t logTime;
+    int uartFault = 0;
+    int lastReason = -1;
+    unsigned int lastJunction = 0U;
+    (void)argument;
+    printf("[line] motors=%d; 3 second start delay\r\n", LINE_MOTORS_ENABLED);
+    (void)MotorWrite(0, 0);
+    hi_sleep(3000U);
+    LineInit(&controller, hi_get_us());
+    sonarStart = hi_get_us() - SONAR_PERIOD_US;
+    logTime = hi_get_us() - 500000U;
+    for (;;) {
+        input.nowUs = hi_get_us();
+        /* Stop is latched until reboot; do not resume when an obstacle moves. */
+        if (uartFault || (LINE_MOTORS_ENABLED && output.reason >= LINE_STOP_SENSOR)) {
+            (void)MotorWrite(0, 0);
+            hi_sleep(100U);
+            continue;
+        }
+        if ((uint32_t)(input.nowUs - sonarStart) >= SONAR_PERIOD_US) {
+            sonarStart = hi_get_us();
+            input.distanceCm = FrontDistance();
+            input.sonarValid = (input.distanceCm > 0.0f);
+        }
+        input.sensorsValid = ReadIR(&input.leftBlack, &input.rightBlack);
+        input.nowUs = hi_get_us();
+        input.sonarAgeUs = (uint32_t)(input.nowUs - sonarStart);
+        if (LINE_MOTORS_ENABLED) {
+            output = LineStep(&controller, &input);
+        }
+        if (MotorWrite(output.left, output.right) != WIFI_IOT_SUCCESS) {
+            uartFault = 1;
+            (void)MotorWrite(0, 0);
+            printf("[line] UART ERROR: physically switch motor power off\r\n");
+        }
+        if ((uint32_t)(input.nowUs - logTime) >= 500000U ||
+            (int)output.reason != lastReason || controller.junctionCount != lastJunction) {
+            logTime = input.nowUs;
+            lastReason = (int)output.reason;
+            lastJunction = controller.junctionCount;
+            printf("[line] valid=%d black L=%d R=%d cm=%.1f wheels=%d,%d reason=%d junction=%u phase=%d\r\n",
+                input.sensorsValid, input.leftBlack, input.rightBlack,
+                input.distanceCm, output.left, output.right, (int)output.reason,
+                controller.junctionCount, (int)controller.phase);
+        }
+        hi_sleep(10U);
+    }
+}
+
+static void LineEntry(void)
+{
+    osThreadAttr_t attr = {
+        .name = "TwoSensorLine", .attr_bits = 0U,
+        .cb_mem = NULL, .cb_size = 0U, .stack_mem = NULL,
+        .stack_size = 4096U, .priority = 25
+    };
+    unsigned int rc = HardwareInit();
+    if (rc != WIFI_IOT_SUCCESS) {
+        (void)MotorWrite(0, 0);
+        printf("[line] init failed=%u; switch motor power off\r\n", rc);
+        return;
+    }
+    if (osThreadNew(LineTask, NULL, &attr) == NULL) {
+        (void)MotorWrite(0, 0);
+        printf("[line] task creation failed\r\n");
+    }
+}
+APP_FEATURE_INIT(LineEntry);
+```
+
+## tests/test_line_control.c
+
+控制逻辑测试源码（尚未执行）。对应文件：[tests/test_line_control.c](17.0_TwoSensor_LineFollowing/tests/test_line_control.c)。
+
+```c
+#include <assert.h>
+#include <stdio.h>
+#include "line_control.h"
+#include "line_config.h"
+
+static LineInput ClearInput(uint32_t now)
+{
+    LineInput in = {0};
+    in.nowUs = now;
+    in.sensorsValid = 1;
+    in.sonarValid = 1;
+    in.distanceCm = 100.0f;
+    return in;
+}
+
+static LineOutput Stable(LineController *c, LineInput *in, int l, int r)
+{
+    unsigned int i;
+    LineOutput out = {0};
+    in->leftBlack = l;
+    in->rightBlack = r;
+    for (i = 0U; i < LINE_STABLE_SAMPLES; ++i) {
+        in->nowUs += 10000U;
+        out = LineStep(c, in);
+    }
+    return out;
+}
+
+static LineOutput ConfirmJunction(LineController *c, LineInput *in)
+{
+    LineOutput out;
+    unsigned int oldCount = c->junctionCount;
+    in->leftBlack = 1; in->rightBlack = 1; in->nowUs += 10000U;
+    out = LineStep(c, in);
+    assert(out.left == 0 && out.right == 0 && out.reason == LINE_JUNCTION_WAIT);
+    assert(c->junctionCount == oldCount);
+    in->nowUs += LINE_JUNCTION_CONFIRM_US;
+    out = LineStep(c, in);
+    assert(c->junctionCount == oldCount + 1U);
+    return out;
+}
+
+static void CaptureAndExit(LineController *c, LineInput *in)
+{
+    unsigned int count = c->junctionCount;
+    LineOutput out;
+    in->nowUs += LINE_ROUTE_MIN_TURN_US;
+    in->leftBlack = 1; in->rightBlack = 0;
+    (void)LineStep(c, in);
+    in->nowUs += LINE_CAPTURE_BLACK_US;
+    (void)LineStep(c, in);
+    in->leftBlack = 0; in->nowUs += 10000U;
+    out = LineStep(c, in);
+    assert(out.left == 0 && out.right == 0);
+    in->nowUs += LINE_CAPTURE_WHITE_US;
+    (void)LineStep(c, in);
+    assert(c->phase == ROUTE_EXIT);
+    /* Same-junction bounce must not consume the second planned turn. */
+    in->leftBlack = 1; in->rightBlack = 1; in->nowUs += 10000U;
+    out = LineStep(c, in);
+    assert(out.left == 0 && out.right == 0 && c->junctionCount == count);
+    in->leftBlack = 0; in->rightBlack = 0; in->nowUs += 10000U;
+    (void)LineStep(c, in);
+    in->nowUs += LINE_JUNCTION_CLEAR_US;
+    (void)LineStep(c, in);
+    assert(c->phase == ROUTE_FOLLOW && c->junctionCount == count);
+}
+
+static void TestRoute(void)
+{
+    LineController c;
+    LineInput in = ClearInput(0U);
+    LineOutput out;
+    LineInit(&c, 0U);
+    (void)Stable(&c, &in, 0, 0);
+    /* A brief double-black stops temporarily but is not counted. */
+    in.leftBlack = 1; in.rightBlack = 1; in.nowUs += 10000U;
+    (void)LineStep(&c, &in);
+    in.leftBlack = 0; in.rightBlack = 0; in.nowUs += 10000U;
+    (void)LineStep(&c, &in);
+    assert(c.junctionCount == 0U && c.phase == ROUTE_FOLLOW);
+    out = ConfirmJunction(&c, &in);
+    assert(out.reason == LINE_ROUTE_LEFT && out.left < 0 && out.right > 0);
+    CaptureAndExit(&c, &in);
+    out = ConfirmJunction(&c, &in);
+    assert(out.reason == LINE_ROUTE_RIGHT && out.left > 0 && out.right < 0);
+    CaptureAndExit(&c, &in);
+    in.leftBlack = 1; in.rightBlack = 1;
+    assert(LineStep(&c, &in).reason == LINE_STOP_AMBIGUOUS);
+    assert(c.junctionCount == 2U);
+
+    /* White alone during a turn must NOT declare successful reacquisition. */
+    in = ClearInput(0U); LineInit(&c, 0U);
+    (void)Stable(&c, &in, 0, 0);
+    (void)ConfirmJunction(&c, &in);
+    in.leftBlack = 0; in.rightBlack = 0;
+    in.nowUs += LINE_ROUTE_MIN_TURN_US + LINE_CAPTURE_WHITE_US;
+    (void)LineStep(&c, &in);
+    assert(c.phase == ROUTE_TURN);
+    in.nowUs = c.phaseSinceUs + LINE_ROUTE_MAX_TURN_US;
+    assert(LineStep(&c, &in).reason == LINE_STOP_TURN_TIMEOUT);
+
+    /* A stuck double-black cannot increment count repeatedly. */
+    in = ClearInput(0U); LineInit(&c, 0U);
+    (void)Stable(&c, &in, 0, 0);
+    (void)ConfirmJunction(&c, &in);
+    in.nowUs += LINE_ROUTE_MAX_TURN_US;
+    assert(LineStep(&c, &in).reason == LINE_STOP_TURN_TIMEOUT);
+    assert(c.junctionCount == 1U);
+
+    /* Obstacle checking overrides even an active route turn. */
+    in = ClearInput(0U); LineInit(&c, 0U);
+    (void)Stable(&c, &in, 0, 0);
+    (void)ConfirmJunction(&c, &in);
+    in.distanceCm = 10.0f;
+    assert(LineStep(&c, &in).reason == LINE_STOP_OBSTACLE);
+
+    /* Route timing also works over the microsecond timer wrap. */
+    in = ClearInput(UINT32_MAX - 10000U); LineInit(&c, in.nowUs);
+    (void)Stable(&c, &in, 0, 0);
+    assert(ConfirmJunction(&c, &in).reason == LINE_ROUTE_LEFT);
+    CaptureAndExit(&c, &in);
+}
+
+int main(void)
+{
+    LineController c;
+    LineInput in = ClearInput(0U);
+    LineOutput out;
+    LineInit(&c, 0U);
+    out = LineStep(&c, &in);
+    assert(out.left == 0 && out.right == 0);
+    out = Stable(&c, &in, 0, 0);
+    assert(out.reason == LINE_FORWARD && out.left == out.right && out.left > 0);
+    out = Stable(&c, &in, 1, 0);
+    assert(out.reason == LINE_LEFT && out.left < out.right);
+    out = Stable(&c, &in, 0, 1);
+    assert(out.reason == LINE_RIGHT && out.left > out.right);
+    out = Stable(&c, &in, 0, 0);
+    assert(out.reason == LINE_FORWARD);
+
+    /* Starting directly on a black bar remains a latched stop. */
+    LineInit(&c, in.nowUs);
+    in.leftBlack = 1; in.rightBlack = 1;
+    out = LineStep(&c, &in);
+    assert(out.reason == LINE_STOP_AMBIGUOUS && out.left == 0 && out.right == 0);
+    in.leftBlack = 0; in.rightBlack = 0;
+    assert(LineStep(&c, &in).reason == LINE_STOP_AMBIGUOUS);
+
+    LineInit(&c, in.nowUs);
+    in.distanceCm = LINE_STOP_DISTANCE_CM;
+    assert(LineStep(&c, &in).reason == LINE_STOP_OBSTACLE);
+    LineInit(&c, in.nowUs);
+    in.distanceCm = 100.0f; in.sonarValid = 0;
+    assert(LineStep(&c, &in).reason == LINE_STOP_SONAR);
+    LineInit(&c, in.nowUs);
+    in.sonarValid = 1; in.sonarAgeUs = LINE_SONAR_MAX_AGE_US + 1U;
+    assert(LineStep(&c, &in).reason == LINE_STOP_SONAR);
+    LineInit(&c, in.nowUs);
+    in.sonarAgeUs = 0U; in.distanceCm = -1.0f;
+    assert(LineStep(&c, &in).reason == LINE_STOP_SONAR);
+    LineInit(&c, in.nowUs);
+    in.distanceCm = 100.0f; in.sensorsValid = 0;
+    assert(LineStep(&c, &in).reason == LINE_STOP_SENSOR);
+
+    in = ClearInput(0U); LineInit(&c, 0U);
+    (void)Stable(&c, &in, 0, 0);
+    in.nowUs += LINE_MAX_WHITE_US;
+    assert(LineStep(&c, &in).reason == LINE_STOP_WHITE_TIMEOUT);
+    in = ClearInput(0U); LineInit(&c, 0U);
+    (void)Stable(&c, &in, 1, 0);
+    in.nowUs += LINE_MAX_CORRECTION_US;
+    assert(LineStep(&c, &in).reason == LINE_STOP_CORRECTION_TIMEOUT);
+    in = ClearInput(LINE_MAX_RUN_US); LineInit(&c, 0U);
+    assert(LineStep(&c, &in).reason == LINE_STOP_RUN_TIMEOUT);
+
+    /* A lone black sample must not flip steering. */
+    in = ClearInput(0U); LineInit(&c, 0U);
+    (void)Stable(&c, &in, 0, 0);
+    in.leftBlack = 1; in.nowUs += 10000U;
+    assert(LineStep(&c, &in).reason == LINE_FORWARD);
+    in.leftBlack = 0; in.nowUs += 10000U;
+    assert(LineStep(&c, &in).reason == LINE_FORWARD);
+
+    /* Timer subtraction across the uint32 microsecond wrap. */
+    in = ClearInput(UINT32_MAX - 10000U); LineInit(&c, in.nowUs);
+    out = Stable(&c, &in, 0, 0);
+    assert(out.reason == LINE_FORWARD && out.left > 0);
+    in.nowUs += LINE_MAX_WHITE_US;
+    assert(LineStep(&c, &in).reason == LINE_STOP_WHITE_TIMEOUT);
+    TestRoute();
+    puts("line_control tests passed");
+    return 0;
+}
+```
+”或“已跑完全程”。
